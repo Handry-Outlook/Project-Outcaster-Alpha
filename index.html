@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -64,7 +65,7 @@
       'enhanced risk': '#ff7f27',
       'moderate risk': '#ec1c24',
       'high risk': '#b83dba',
-      'severe risk': '#800080'
+      'severe risk': '#000000'
     };
     const RISK_ORDER = ['low risk', 'slight risk', 'enhanced risk', 'moderate risk', 'high risk', 'severe risk'];
 
@@ -365,470 +366,799 @@
       }
     };
    const calculateScore = async (polygons, date, outlookId) => {
-    try {
-      console.log(`Calculating score for outlook ${outlookId} on date ${date}`);
+  try {
+    console.log(`Calculating score for outlook ${outlookId} on date ${date}`);
 
-      // Fetch lightning strikes for the given date
-      const strikes = await fetchLightningData(date, (error) => console.error('Score calculation error:', error));
-      if (!strikes || strikes.length === 0) {
-        console.warn(`No lightning strikes available for ${date}`);
-        return 1; // Minimum score to avoid 0
-      }
+    // Fetch lightning strikes for the given date
+    const strikes = await fetchLightningData(date, (error) => console.error('Score calculation error:', error));
+    if (!strikes || strikes.length === 0) {
+      console.warn(`No lightning strikes available for ${date}`);
+      return 1; // Minimum score to avoid 0
+    }
 
-      // Fetch severe weather reports for the given date
-      const severeReportsSnapshot = await db.collection('severe_reports')
-        .where('date', '==', date)
-        .get();
-      const severeReports = severeReportsSnapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-      }));
+    // Fetch severe weather reports for the given date
+    const startTime = new Date(`${date}T06:00:00+01:00`);
+    const endTime = new Date(startTime);
+    endTime.setDate(startTime.getDate() + 1);
+    endTime.setHours(5, 59, 59, 999);
+    const severeReportsSnapshot = await db.collection('severe_reports')
+      .where('date', '==', date)
+      .get();
+    const severeReports = severeReportsSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+      observedAt: doc.data().observedAt ? new Date(doc.data().observedAt) : null
+    })).filter(report => {
+      if (!report.observedAt) return true; // Include reports without observedAt for backward compatibility
+      return report.observedAt >= startTime && report.observedAt <= endTime;
+    });
 
-      // Generate sample points for non-strike areas
-      const generateSamplePoints = (polygons, numPoints = 30) => {
-        const samplePoints = [];
-        const totalPolys = polygons.reduce((sum, p) => {
-          const geom = turf.polygon(p.geometry.coordinates);
-          return sum + (geom.geometry.type === 'Polygon' ? 1 : geom.geometry.coordinates.length);
-        }, 0);
-        const pointsPerPoly = Math.max(1, Math.floor(numPoints / totalPolys));
-        polygons.forEach(polygon => {
-          const geom = turf.polygon(polygon.geometry.coordinates);
-          const bbox = turf.bbox(geom);
-          let pointsAdded = 0;
-          let attempts = 0;
-          const maxAttempts = pointsPerPoly * 5; // Reduced attempts for speed
-          while (pointsAdded < pointsPerPoly && attempts < maxAttempts) {
-            const randomPoint = turf.randomPoint(1, { bbox }).features[0];
-            if (turf.booleanPointInPolygon(randomPoint, geom)) {
-              samplePoints.push(randomPoint);
-              pointsAdded++;
-            }
-            attempts++;
+    // Generate sample points for non-strike areas
+    const generateSamplePoints = (polygons, numPoints = 30) => {
+      const samplePoints = [];
+      const totalPolys = polygons.reduce((sum, p) => {
+        const geom = turf.polygon(p.geometry.coordinates);
+        return sum + (geom.geometry.type === 'Polygon' ? 1 : geom.geometry.coordinates.length);
+      }, 0);
+      const pointsPerPoly = Math.max(1, Math.floor(numPoints / totalPolys));
+      polygons.forEach(polygon => {
+        const geom = turf.polygon(polygon.geometry.coordinates);
+        const bbox = turf.bbox(geom);
+        let pointsAdded = 0;
+        let attempts = 0;
+        const maxAttempts = pointsPerPoly * 5;
+        while (pointsAdded < pointsPerPoly && attempts < maxAttempts) {
+          const randomPoint = turf.randomPoint(1, { bbox }).features[0];
+          if (turf.booleanPointInPolygon(randomPoint, geom)) {
+            samplePoints.push(randomPoint);
+            pointsAdded++;
           }
-        });
-        return samplePoints;
-      };
+          attempts++;
+        }
+      });
+      return samplePoints;
+    };
 
-      // Calculate strike density
-      const calculateStrikeDensity = (strikes, point, radiusKm = STRIKE_RADIUS_KM) => {
-        const count = strikes.reduce((sum, strike) => {
-          const distance = turf.distance(
-            turf.point(strike.coordinates),
-            point,
-            { units: 'kilometers' }
-          );
-          return sum + (distance <= radiusKm ? 1 : 0);
-        }, 0);
-        const areaKm2 = Math.PI * radiusKm * radiusKm;
-        return areaKm2 > 0 ? count / areaKm2 : 0;
-      };
+    // Calculate strike density
+    const calculateStrikeDensity = (strikes, point, radiusKm = STRIKE_RADIUS_KM) => {
+      const count = strikes.reduce((sum, strike) => {
+        const distance = turf.distance(
+          turf.point(strike.coordinates),
+          point,
+          { units: 'kilometers' }
+        );
+        return sum + (distance <= radiusKm ? 1 : 0);
+      }, 0);
+      const areaKm2 = Math.PI * radiusKm * radiusKm;
+      return areaKm2 > 0 ? count / areaKm2 : 0;
+    };
 
-      // Map density to risk level
-      const densityToRiskLevel = (density) => {
-        if (density > 0.1) return 'high risk';
-        if (density > 0.05) return 'moderate risk';
-        if (density > 0.02) return 'enhanced risk';
-        if (density > 0.01) return 'slight risk';
-        return 'low risk';
-      };
+    // Map density to risk level
+    const densityToRiskLevel = (density) => {
+      if (density > 0.1) return 'high risk';
+      if (density > 0.05) return 'moderate risk';
+      if (density > 0.02) return 'enhanced risk';
+      if (density > 0.01) return 'slight risk';
+      return 'low risk';
+    };
 
-      // Initialize scoring metrics
-      let hits = 0, misses = 0, falseAlarms = 0, quiescent = 0, severityPenalties = 0;
-      const strikePoints = strikes.map(s => turf.point(s.coordinates));
-      const samplePoints = generateSamplePoints(polygons);
-      const allPoints = [...strikePoints, ...samplePoints];
+    // Initialize scoring metrics
+    let hits = 0, misses = 0, falseAlarms = 0, quiescent = 0, severityPenalties = 0;
+    const strikePoints = strikes.map(s => turf.point(s.coordinates));
+    const samplePoints = generateSamplePoints(polygons);
+    const allPoints = [...strikePoints, ...samplePoints];
 
-      // Batch polygon containment checks
-      const pointsGeoJSON = turf.featureCollection(allPoints);
-      const polygonContains = polygons.map(polygon => {
-        const poly = turf.polygon(polygon.geometry.coordinates);
-        const pointsWithin = turf.pointsWithinPolygon(pointsGeoJSON, poly);
-        return pointsWithin.features.map(f => ({
-          point: f,
-          riskLevel: polygon.properties.Name.toLowerCase()
-        }));
-      }).flat();
+    // Batch polygon containment checks
+    const pointsGeoJSON = turf.featureCollection(allPoints);
+    const polygonContains = polygons.map(polygon => {
+      const poly = turf.polygon(polygon.geometry.coordinates);
+      const pointsWithin = turf.pointsWithinPolygon(pointsGeoJSON, poly);
+      return pointsWithin.features.map(f => ({
+        point: f,
+        riskLevel: polygon.properties.Name.toLowerCase()
+      }));
+    }).flat();
 
-      // Map points to their containing polygons
-      const pointToPolygons = new Map();
-      allPoints.forEach((point, index) => {
-        const polys = polygonContains.filter(pc => pc.point === point).map(pc => pc.riskLevel);
-        pointToPolygons.set(index, polys);
+    // Map points to their containing polygons
+    const pointToPolygons = new Map();
+    allPoints.forEach((point, index) => {
+      const polys = polygonContains.filter(pc => pc.point === point).map(pc => pc.riskLevel);
+      pointToPolygons.set(index, polys);
+    });
+
+    // Process each point
+    for (let i = 0; i < allPoints.length; i++) {
+      const point = allPoints[i];
+      const isStrike = i < strikePoints.length;
+      const containingPolys = pointToPolygons.get(i) || [];
+
+      let highestWeight = 0;
+      let highestPenalty = 0;
+      const inForecast = containingPolys.length > 0;
+
+      // Calculate expected risk based on density
+      const density = isStrike ? calculateStrikeDensity(strikes, point) : 0;
+      const expectedRisk = densityToRiskLevel(density);
+      const expectedWeight = RISK_WEIGHTS[expectedRisk] || 1.0;
+
+      // Find highest risk weight among containing polygons
+      containingPolys.forEach(riskLevel => {
+        if (RISK_ORDER.includes(riskLevel)) {
+          const weight = RISK_WEIGHTS[riskLevel] || 1.0;
+          const penalty = PENALTY_MULTIPLIERS[riskLevel] || 1.0;
+          if (weight > highestWeight) {
+            highestWeight = weight;
+            highestPenalty = penalty;
+          }
+        }
       });
 
-      // Process each point
-      for (let i = 0; i < allPoints.length; i++) {
-        const point = allPoints[i];
-        const isStrike = i < strikePoints.length;
-        const containingPolys = pointToPolygons.get(i) || [];
-
-        let highestWeight = 0;
-        let highestPenalty = 0;
-        const inForecast = containingPolys.length > 0;
-
-        // Calculate expected risk based on density
-        const density = isStrike ? calculateStrikeDensity(strikes, point) : 0;
-        const expectedRisk = densityToRiskLevel(density);
-        const expectedWeight = RISK_WEIGHTS[expectedRisk] || 1.0;
-
-        // Find highest risk weight among containing polygons
-        containingPolys.forEach(riskLevel => {
-          if (RISK_ORDER.includes(riskLevel)) {
-            const weight = RISK_WEIGHTS[riskLevel] || 1.0;
-            const penalty = PENALTY_MULTIPLIERS[riskLevel] || 1.0;
-            if (weight > highestWeight) {
-              highestWeight = weight;
-              highestPenalty = penalty;
-            }
-          }
-        });
-
-        // Update metrics
-        if (isStrike) {
-          if (inForecast) {
-            hits += highestWeight;
-            if (highestWeight < expectedWeight) {
-              severityPenalties += (expectedWeight - highestWeight);
-            }
-          } else {
-            misses += 1;
-            if (expectedWeight > 1.0) {
-              severityPenalties += expectedWeight;
-            }
+      // Update metrics
+      if (isStrike) {
+        if (inForecast) {
+          hits += highestWeight;
+          if (highestWeight < expectedWeight) {
+            severityPenalties += (expectedWeight - highestWeight);
           }
         } else {
-          if (inForecast) {
-            falseAlarms += highestWeight * highestPenalty;
-          } else {
-            quiescent += 1;
+          misses += 1;
+          if (expectedWeight > 1.0) {
+            severityPenalties += expectedWeight;
           }
         }
+      } else {
+        if (inForecast) {
+          falseAlarms += highestWeight * highestPenalty;
+        } else {
+          quiescent += 1;
+        }
       }
-
-      // Calculate severe weather bonuses/penalties
-      const severePolygons = polygons.filter(p => p.properties.Name.toLowerCase() === 'severe risk');
-      let severeScore = 0;
-      const maxSevereBonus = 10; // Max contribution to final score
-      const severeReportsCount = severeReports.length || 1;
-      severePolygons.forEach(polygon => {
-        const conditions = polygon.properties.severeConditions || {};
-        const poly = turf.polygon(polygon.geometry.coordinates);
-        Object.keys(conditions).forEach(condition => {
-          const hasReport = severeReports.some(report => {
-            if (report.location && report.location.length === 2 && report.condition.toLowerCase() === condition) {
-              const point = turf.point(report.location);
-              return turf.booleanPointInPolygon(point, poly);
-            }
-            return false;
-          });
-          if (conditions[condition] && hasReport) {
-            severeScore += 10 / severeReportsCount; // Scaled bonus
-          } else if (conditions[condition] && !hasReport) {
-            severeScore -= 5 / severeReportsCount; // Scaled penalty
-          }
-        });
-      });
-      severeScore = Math.min(maxSevereBonus, Math.max(-maxSevereBonus, severeScore));
-
-      // Calculate normalized score (1–100)
-      const total = hits + misses + falseAlarms + quiescent;
-      const accuracy = total > 0 ? ((hits + quiescent) / total) * 90 : 0; // Base score 0–90
-      const finalScore = Math.min(100, Math.max(1, Math.round(accuracy + severeScore)));
-
-      // Update Firestore with the calculated score
-      await db.collection('outlooks').doc(outlookId).update({
-        score: finalScore,
-        updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-      });
-
-      console.log(`Score calculated for outlook ${outlookId}: ${finalScore}`);
-      return finalScore;
-    } catch (err) {
-      console.error(`Error calculating score for outlook ${outlookId}:`, err);
-      return 1; // Minimum score on error
     }
+
+    // Calculate severe weather bonuses/penalties
+    const severePolygons = polygons.filter(p => p.properties.Name.toLowerCase() === 'severe risk');
+    let severeScore = 0;
+    const maxSevereBonus = 10; // Max contribution to final score
+    const severeReportsCount = severeReports.length || 1;
+    severePolygons.forEach(polygon => {
+      const conditions = polygon.properties.severeConditions || {};
+      const poly = turf.polygon(polygon.geometry.coordinates);
+      Object.keys(conditions).forEach(condition => {
+        const hasReport = severeReports.some(report => {
+          if (
+            report.location &&
+            report.location.length === 2 &&
+            report.condition.toLowerCase() === condition &&
+            report.observedAt &&
+            report.observedAt >= startTime &&
+            report.observedAt <= endTime
+          ) {
+            const point = turf.point(report.location);
+            return turf.booleanPointInPolygon(point, poly);
+          }
+          return false;
+        });
+        if (conditions[condition] && hasReport) {
+          severeScore += 10 / severeReportsCount; // Scaled bonus
+        } else if (conditions[condition] && !hasReport) {
+          severeScore -= 5 / severeReportsCount; // Scaled penalty
+        }
+      });
+    });
+    severeScore = Math.min(maxSevereBonus, Math.max(-maxSevereBonus, severeScore));
+
+    // Calculate normalized score (1–100)
+    const total = hits + misses + falseAlarms + quiescent;
+    const accuracy = total > 0 ? ((hits + quiescent) / total) * 90 : 0; // Base score 0–90
+    const finalScore = Math.min(100, Math.max(1, Math.round(accuracy + severeScore)));
+
+    // Update Firestore with the calculated score
+    await db.collection('outlooks').doc(outlookId).update({
+      score: finalScore,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log(`Score calculated for outlook ${outlookId}: ${finalScore}`);
+    return finalScore;
+  } catch (err) {
+    console.error(`Error calculating score for outlook ${outlookId}:`, err);
+    return 1; // Minimum score on error
+  }
+};
+    const NavBar = ({ user }) => {
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isOutlooksOpen, setIsOutlooksOpen] = useState(false);
+
+  const toggleMenu = () => {
+    setIsMenuOpen(!isMenuOpen);
+    if (isOutlooksOpen) setIsOutlooksOpen(false);
   };
-    const NavBar = ({ user, username }) => (
-      <nav className="bg-blue-700 p-4 text-white shadow-md relative">
-        <div className="container mx-auto flex justify-between items-center">
-          <ul className="flex space-x-6">
-            <li><Link to="/" className="hover:text-blue-200">Welcome</Link></li>
-            {user ? (
-              <>
-                <li><Link to="/create" className="hover:text-blue-200">Create Outlook</Link></li>
-                <li><Link to="/view" className="hover:text-blue-200">View Outlooks</Link></li>
-                <li><Link to="/your-uploads" className="hover:text-blue-200">Your Uploads</Link></li>
-                {user.email === 'admin@example.com' && <li><Link to="/admin" className="hover:text-blue-200">Admin</Link></li>}
-                <li><Link to="/leaderboard" className="hover:text-blue-200">Leaderboard</Link></li>
-                <li><Link to="/archive" className="hover:text-blue-200">Archive</Link></li>
-                <li><button onClick={() => auth.signOut()} className="hover:text-blue-200">Logout</button></li>
-              </>
-            ) : (
-              <li><Link to="/account" className="hover:text-blue-200">Account</Link></li>
-            )}
-          </ul>
-          {username && (
-            <span className="absolute top-4 right-4 text-sm">
-              Welcome, {username}
-            </span>
-          )}
+
+  const toggleOutlooks = () => {
+    setIsOutlooksOpen(!isOutlooksOpen);
+  };
+
+  return (
+    <nav className="bg-[#488eaf] text-white p-4">
+      <div className="container mx-auto flex justify-between items-center">
+        <Link to="/" className="text-2xl font-bold">
+          Project Outcaster
+        </Link>
+        <div className="md:hidden">
+          <button onClick={toggleMenu} className="focus:outline-none">
+            {isMenuOpen ? '✖' : '☰'}
+          </button>
         </div>
-      </nav>
-    );
+        <ul
+          className={`md:flex md:items-center md:space-x-6 absolute md:static top-16 left-0 w-full md:w-auto bg-[#488eaf] md:bg-transparent transition-all duration-300 ease-in-out ${
+            isMenuOpen ? 'flex flex-col p-4' : 'hidden'
+          } z-20`}
+        >
+          {user ? (
+            <>
+              <li>
+                <Link
+                  to="/create"
+                  className="block py-2 md:py-0 hover:text-blue-200 text-lg"
+                  onClick={() => setIsMenuOpen(false)}
+                >
+                  Create Outlook
+                </Link>
+              </li>
+              <li className="relative">
+                <button
+                  className="block py-2 md:py-0 hover:text-blue-200 text-lg w-full text-left md:w-auto flex justify-between items-center"
+                  onClick={toggleOutlooks}
+                >
+                  Outlooks
+                  <span className="ml-2 md:hidden">{isOutlooksOpen ? '▲' : '▼'}</span>
+                </button>
+                <ul
+                  className={`${
+                    isOutlooksOpen ? 'flex' : 'hidden'
+                  } flex-col mt-2 md:absolute md:bg-[#488eaf] md:rounded-lg md:shadow-lg md:w-48 pl-4 md:pl-0 md:mt-1 z-20`}
+                >
+                  <li>
+                    <Link
+                      to="/view"
+                      className="block py-2 md:py-1 px-4 hover:text-blue-200 text-lg"
+                      onClick={() => {
+                        setIsOutlooksOpen(false);
+                        setIsMenuOpen(false);
+                      }}
+                    >
+                      View Outlooks
+                    </Link>
+                  </li>
+                  <li>
+                    <Link
+                      to="/archive"
+                      className="block py-2 md:py-1 px-4 hover:text-blue-200 text-lg"
+                      onClick={() => {
+                        setIsOutlooksOpen(false);
+                        setIsMenuOpen(false);
+                      }}
+                    >
+                      Archive
+                    </Link>
+                  </li>
+                </ul>
+              </li>
+              <li>
+                <Link
+                  to="/your-uploads"
+                  className="block py-2 md:py-0 hover:text-blue-200 text-lg"
+                  onClick={() => setIsMenuOpen(false)}
+                >
+                  Your Uploads
+                </Link>
+              </li>
+              <li>
+                <Link
+                  to="/add-severe-report"
+                  className="block py-2 md:py-0 hover:text-blue-200 text-lg"
+                  onClick={() => setIsMenuOpen(false)}
+                >
+                  Add Severe Report
+                </Link>
+              </li>
+              {user.email === 'admin@example.com' && (
+                <li>
+                  <Link
+                    to="/admin"
+                    className="block py-2 md:py-0 hover:text-blue-200 text-lg"
+                    onClick={() => setIsMenuOpen(false)}
+                  >
+                    Admin
+                  </Link>
+                </li>
+              )}
+              <li>
+                <Link
+                  to="/leaderboard"
+                  className="block py-2 md:py-0 hover:text-blue-200 text-lg"
+                  onClick={() => setIsMenuOpen(false)}
+                >
+                  Leaderboard
+                </Link>
+              </li>
+              <li>
+                <button
+                  onClick={() => {
+                    auth.signOut();
+                    setIsMenuOpen(false);
+                  }}
+                  className="block py-2 md:py-0 hover:text-blue-200 text-lg w-full text-left"
+                >
+                  Logout
+                </button>
+              </li>
+            </>
+          ) : (
+            <li>
+              <Link
+                to="/account"
+                className="block py-2 md:py-0 hover:text-blue-200 text-lg"
+                onClick={() => setIsMenuOpen(false)}
+              >
+                Account
+              </Link>
+            </li>
+          )}
+        </ul>
+      </div>
+    </nav>
+  );
+};
 
     const WelcomePage = () => {
-    const [error, setError] = useState(null);
-    const [selectedUsername, setSelectedUsername] = useState(null);
-    const [selectedOutlook, setSelectedOutlook] = useState(null);
-    const mapRef = useRef(null);
-    const mapInitialized = useRef(false);
+  const [error, setError] = useState(null);
+  const [selectedUsername, setSelectedUsername] = useState(null);
+  const [selectedOutlook, setSelectedOutlook] = useState(null);
+  const [communityDate, setCommunityDate] = useState(new Date().toISOString().split('T')[0]); // 2025-06-27
+  const [communityOutlooks, setCommunityOutlooks] = useState([]);
+  const [cellSize, setCellSize] = useState(window.innerWidth < 768 ? 0.3 : 0.1);
+  const communityMapRef = useRef(null);
+  const forecasterMapRef = useRef(null);
+  const communityMapInitialized = useRef(false);
+  const forecasterMapInitialized = useRef(false);
 
-    useEffect(() => {
-      localStorage.setItem('welcomePageVisited', 'true');
-      console.log('Welcome page visited, flag set');
+  const RISK_LEVELS = {
+    'no risk': 0,
+    'low risk': 1,
+    'slight risk': 2,
+    'enhanced risk': 3,
+    'moderate risk': 4,
+    'high risk': 5
+  };
 
-      const fetchAndDisplayOutlook = async () => {
-        try {
-          const currentDate = new Date('2025-06-26').toISOString().split('T')[0];
-          const snapshot = await db.collection('outlooks')
-            .where('date', '>=', currentDate)
-            .get();
-          const outlooks = snapshot.docs.map(doc => ({
-            id: doc.id,
-            ...doc.data(),
-            createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt || Date.now())
-          }));
-          console.log('Fetched outlooks:', outlooks);
+  const RISK_COLORS = {
+    'no risk': '#ffffff',
+    'low risk': '#66c2a4',
+    'slight risk': '#fff200',
+    'enhanced risk': '#ff7f27',
+    'moderate risk': '#ec1c24',
+    'high risk': '#b83dba'
+  };
 
-          if (outlooks.length === 0) {
-            setError('No forecasts available for today or future');
-            return;
-          }
+  const getNextAvailableDate = async (currentDate) => {
+    try {
+      const snapshot = await db.collection('outlooks')
+        .where('date', '>=', currentDate)
+        .orderBy('date', 'asc')
+        .limit(1)
+        .get();
+      return snapshot.empty ? currentDate : snapshot.docs[0].data().date;
+    } catch (err) {
+      console.error('Error finding next available date:', err);
+      return currentDate;
+    }
+  };
 
-          // Calculate average scores per user, including outlooks with null scores
-          const averagedScores = outlooks.reduce((acc, curr) => {
-            const { username, score } = curr;
-            if (!username) {
-              console.warn('Outlook missing username:', curr.id, curr);
-              return acc; // Skip outlooks without username
-            }
-            acc[username] = acc[username] || { total: 0, count: 0, outlooks: [] };
-            acc[username].outlooks.push(curr);
-            if (score != null && !isNaN(score)) {
-              acc[username].total += score;
-              acc[username].count += 1;
-            }
-            return acc;
-          }, {});
+  const fetchCommunityOutlook = async (date) => {
+    console.log('Fetching community outlook for date:', date);
+    try {
+      const snapshot = await db.collection('outlooks').where('date', '==', date).get();
+      const allOutlooks = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt || Date.now())
+      }));
+      console.log('Fetched community outlooks:', allOutlooks);
 
-          console.log('Averaged scores:', averagedScores);
-
-          // Sort users by average score (or number of outlooks if no scores)
-          const sortedUsers = Object.entries(averagedScores)
-            .map(([username, data]) => ({
-              username,
-              avgScore: data.count > 0 ? data.total / data.count : 0,
-              outlookCount: data.outlooks.length
-            }))
-            .sort((a, b) => {
-              if (a.avgScore === b.avgScore) {
-                return b.outlookCount - a.outlookCount; // Prefer users with more outlooks
-              }
-              return b.avgScore - a.avgScore;
-            });
-
-          console.log('Sorted users by average score:', sortedUsers);
-
-          let selectedOutlook = null;
-          let selectedUsername = null;
-
-          // Try to select the most recent outlook from the top-scoring user
-          if (sortedUsers.length > 0) {
-            const topUser = sortedUsers[0].username;
-            const userOutlooks = averagedScores[topUser].outlooks
-              .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-            selectedOutlook = userOutlooks[0];
-            selectedUsername = topUser;
-          } else {
-            // Fallback: select the most recent outlook from all outlooks
-            console.warn('No users with valid scores, falling back to most recent outlook');
-            selectedOutlook = outlooks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
-            selectedUsername = selectedOutlook.username || 'Unknown';
-          }
-
-          if (!selectedOutlook) {
-            console.warn('No outlook selected after fallback');
-            setError('No valid forecast available to display');
-            return;
-          }
-
-          console.log('Selected outlook:', selectedOutlook.id, 'by', selectedUsername, 'for date', selectedOutlook.date);
-          setSelectedUsername(selectedUsername);
-          setSelectedOutlook(selectedOutlook);
-          waitForLeaflet(() => initializeMap(selectedOutlook));
-        } catch (err) {
-          console.error('Error fetching or displaying outlook:', err);
-          if (err.code === 'failed-precondition' && err.message.includes('index')) {
-            setError('Database index required. Please contact the administrator to create an index for outlooks.');
-          } else {
-            setError(`Failed to load forecast data: ${err.message}`);
-          }
+      const latestOutlooks = Object.values(allOutlooks.reduce((acc, outlook) => {
+        if (!outlook.username) return acc;
+        if (!acc[outlook.username] || new Date(outlook.createdAt) > new Date(acc[outlook.username].createdAt)) {
+          acc[outlook.username] = outlook;
         }
-      };
+        return acc;
+      }, {}));
 
-      fetchAndDisplayOutlook();
-
-      return () => {
-        if (mapRef.current) {
-          console.log('Cleaning up WelcomePage map');
-          mapRef.current.remove();
-          mapRef.current = null;
-          mapInitialized.current = false;
+      const allUserOutlooks = await db.collection('outlooks').get();
+      const userScores = allUserOutlooks.docs.reduce((acc, doc) => {
+        const { username, score } = doc.data();
+        if (!username) return acc;
+        acc[username] = acc[username] || { total: 0, count: 0 };
+        if (score != null && !isNaN(score)) {
+          acc[username].total += score;
+          acc[username].count += 1;
         }
-      };
-    }, []);
+        return acc;
+      }, {});
 
-    const initializeMap = (outlook) => {
-      if (mapInitialized.current || !window.L || !document.getElementById('welcome-map')) {
-        console.warn('Map already initialized or Leaflet/container not available');
-        return;
-      }
-      try {
-        console.log('Initializing Leaflet map for WelcomePage');
-        const map = L.map('welcome-map', {
-          zoomControl: true,
-          minZoom: 5,
-          maxZoom: 10,
-          maxBounds: [[UK_BBOX[1], UK_BBOX[0]], [UK_BBOX[3], UK_BBOX[2]]]
-        }).setView([54.5, -3], 6);
-        mapRef.current = map;
-        mapInitialized.current = true;
+      const weightedOutlooks = latestOutlooks.map(outlook => ({
+        ...outlook,
+        weight: userScores[outlook.username]?.count > 0
+          ? userScores[outlook.username].total / userScores[outlook.username].count || 1
+          : 1
+      }));
 
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          maxZoom: 19,
-          attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-        })
-          .addTo(map)
-          .on('tileerror', (error, tile) => {
-            console.error('Tile error:', error, tile);
-            setError('Failed to load map tiles');
-          });
+      setCommunityOutlooks(weightedOutlooks);
+      updateCommunityMap(weightedOutlooks, date);
+    } catch (err) {
+      console.error('Error fetching community outlook:', err);
+      setError(`Failed to load community forecast: ${err.message}`);
+    }
+  };
 
-        if (!outlook || !outlook.polygons || outlook.polygons.length === 0) {
-          console.warn('No valid outlook provided for map display:', outlook);
-          setError('No valid forecast areas available');
-          return;
-        }
+  const initializeCommunityMap = () => {
+    if (communityMapInitialized.current || !window.L || !document.getElementById('community-map')) return;
+    try {
+      console.log('Initializing community map');
+      const map = L.map('community-map', {
+        zoomControl: true, minZoom: 5, maxZoom: 10,
+        maxBounds: [[UK_BBOX[1], UK_BBOX[0]], [UK_BBOX[3], UK_BBOX[2]]]
+      }).setView([54.5, -3], 6);
+      communityMapRef.current = map;
+      communityMapInitialized.current = true;
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+      }).addTo(map).on('tileerror', (error) => {
+        console.error('Community map tile error:', error);
+        setError('Failed to load community map tiles');
+      });
+      if (communityOutlooks.length) updateCommunityMap(communityOutlooks, communityDate);
+    } catch (err) {
+      console.error('Error initializing community map:', err);
+      setError('Failed to initialize community map');
+    }
+  };
 
-        const parsedPolygons = outlook.polygons
-          .map(p => {
-            try {
-              return {
-                ...p,
-                geometry: {
-                  ...p.geometry,
-                  coordinates: typeof p.geometry.coordinates === 'string' 
-                    ? JSON.parse(p.geometry.coordinates) 
-                    : p.geometry.coordinates
-                },
-                properties: {
-                  ...p.properties,
-                  Name: p.properties.Name || 'low risk',
-                  color: p.properties.color || RISK_COLORS[p.properties.Name?.toLowerCase() || 'low risk']
-                }
-              };
-            } catch (err) {
-              console.error('Error parsing polygon:', p, err);
-              return null;
-            }
-          })
-          .filter(p => p !== null);
+  const initializeForecasterMap = (outlook) => {
+    if (forecasterMapInitialized.current || !window.L || !document.getElementById('welcome-map')) return;
+    try {
+      console.log('Initializing top forecaster map');
+      const map = L.map('welcome-map', {
+        zoomControl: true, minZoom: 5, maxZoom: 10,
+        maxBounds: [[UK_BBOX[1], UK_BBOX[0]], [UK_BBOX[3], UK_BBOX[2]]]
+      }).setView([54.5, -3], 6);
+      forecasterMapRef.current = map;
+      forecasterMapInitialized.current = true;
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+      }).addTo(map).on('tileerror', (error) => {
+        console.error('Top forecaster map tile error:', error);
+        setError('Failed to load map tiles');
+      });
+
+      if (outlook?.polygons?.length) {
+        const parsedPolygons = outlook.polygons.map(p => {
+          try {
+            return {
+              ...p,
+              geometry: { ...p.geometry, coordinates: JSON.parse(p.geometry.coordinates) || p.geometry.coordinates },
+              properties: { ...p.properties, Name: p.properties.Name || 'low risk', color: p.properties.color || RISK_COLORS[p.properties.Name?.toLowerCase() || 'low risk'] }
+            };
+          } catch (err) {
+            console.error('Error parsing polygon:', p, err);
+            return null;
+          }
+        }).filter(p => p);
         console.log('Parsed polygons for WelcomePage:', parsedPolygons);
-
-        if (parsedPolygons.length === 0) {
-          console.warn('No valid polygons after parsing');
-          setError('Invalid forecast areas');
-          return;
-        }
 
         const polygonsByRisk = RISK_ORDER.reduce((acc, risk) => {
           acc[risk] = parsedPolygons.filter(p => p.properties.Name.toLowerCase() === risk);
           return acc;
         }, {});
-        console.log('Polygons by risk:', polygonsByRisk);
 
         RISK_ORDER.forEach(risk => {
-          if (polygonsByRisk[risk].length > 0) {
-            const style = feature => {
-              const riskLevel = feature.properties.Name?.toLowerCase();
-              const color = RISK_COLORS[riskLevel] || '#66c2a4';
-              if (!RISK_COLORS[riskLevel]) {
-                console.warn('Invalid risk level:', riskLevel, 'for polygon', feature);
-              }
-              console.log('Assigning color for', feature.properties.Name, ':', color);
-              return {
-                color,
-                fillColor: risk === 'severe risk' ? 'transparent' : color,
+          if (polygonsByRisk[risk].length) {
+            L.geoJSON(polygonsByRisk[risk], {
+              style: feature => ({
+                color: RISK_COLORS[feature.properties.Name?.toLowerCase()] || '#66c2a4',
+                fillColor: risk === 'severe risk' ? 'transparent' : RISK_COLORS[feature.properties.Name?.toLowerCase()] || '#66c2a4',
                 fillOpacity: risk === 'severe risk' ? 0 : 0.4,
                 weight: 2
-              };
-            };
-            const layer = L.geoJSON(polygonsByRisk[risk], { style }).addTo(map);
+              })
+            }).addTo(map);
             console.log('Added GeoJSON layer for', risk);
           }
         });
+      } else {
+        console.warn('No valid outlook provided for top forecaster map:', outlook);
+        setError('No valid forecast areas available');
+      }
+    } catch (err) {
+      console.error('Error initializing top forecaster map:', err);
+      setError('Failed to initialize top forecaster map');
+    }
+  };
 
-        setTimeout(() => {
-          if (mapRef.current) {
-            mapRef.current.invalidateSize();
-            console.log('Map size invalidated after data load');
+  const updateCommunityMap = (outlooks, date) => {
+    if (!communityMapRef.current) {
+      console.warn('Community map not available');
+      setError('Failed to update community map: container not found');
+      return;
+    }
+    console.log('Updating community map');
+    communityMapRef.current.eachLayer(layer => {
+      if (layer instanceof L.Rectangle || layer instanceof L.GeoJSON) communityMapRef.current.removeLayer(layer);
+    });
+
+    if (!outlooks.length) {
+      console.warn('No outlooks provided for community map');
+      setError('No community forecast available for selected date');
+      return;
+    }
+
+    const allPolygons = outlooks.flatMap(outlook =>
+      (outlook.polygons || []).filter(p => p.properties.Name.toLowerCase() !== 'severe risk').map(p => {
+        try {
+          return {
+            ...p,
+            geometry: { ...p.geometry, coordinates: JSON.parse(p.geometry.coordinates) || p.geometry.coordinates },
+            properties: { ...p.properties, Name: p.properties.Name || 'low risk', weight: outlook.weight }
+          };
+        } catch (err) {
+          console.error('Error parsing polygon:', p, err);
+          return null;
+        }
+      }).filter(p => p)
+    );
+
+    if (!allPolygons.length) {
+      console.warn('No valid polygons for community outlook');
+      setError('No valid community forecast areas');
+      return;
+    }
+
+    const bbox = [UK_BBOX[0], UK_BBOX[1], UK_BBOX[2], UK_BBOX[3]];
+    const grid = turf.pointGrid(bbox, cellSize, { units: 'degrees' });
+    const gridCells = grid.features.map(point => {
+      let totalWeightedScore = 0, totalWeight = 0;
+      allPolygons.forEach(polygon => {
+        if (turf.booleanPointInPolygon(point, polygon)) {
+          const riskLevel = polygon.properties.Name.toLowerCase();
+          const score = RISK_LEVELS[riskLevel] || 0;
+          const weight = polygon.properties.weight || 1;
+          totalWeightedScore += score * weight;
+          totalWeight += weight;
+        }
+      });
+      const meanScore = totalWeight > 0 ? totalWeightedScore / totalWeight : 0;
+      const roundedScore = Math.round(meanScore);
+      const riskLevel = Object.keys(RISK_LEVELS).find(key => RISK_LEVELS[key] === roundedScore) || 'no risk';
+      const [lng, lat] = point.geometry.coordinates;
+      return {
+        type: 'Feature',
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[
+            [lng - cellSize / 2, lat - cellSize / 2],
+            [lng + cellSize / 2, lat - cellSize / 2],
+            [lng + cellSize / 2, lat + cellSize / 2],
+            [lng - cellSize / 2, lat + cellSize / 2],
+            [lng - cellSize / 2, lat - cellSize / 2]
+          ]]
+        },
+        properties: { Name: riskLevel, score: roundedScore, color: RISK_COLORS[riskLevel] || '#ffffff' }
+      };
+    });
+
+    console.log('Computed grid cells for community map:', gridCells);
+
+    gridCells.forEach(cell => {
+      const bounds = [
+        [cell.geometry.coordinates[0][0][1], cell.geometry.coordinates[0][0][0]],
+        [cell.geometry.coordinates[0][2][1], cell.geometry.coordinates[0][2][0]]
+      ];
+      L.rectangle(bounds, {
+        color: cell.properties.color,
+        fillColor: cell.properties.color,
+        fillOpacity: 0.4,
+        weight: 1
+      }).bindPopup(`Risk Level: ${cell.properties.Name}<br>Score: ${cell.properties.score}`).addTo(communityMapRef.current);
+    });
+
+    requestAnimationFrame(() => {
+      if (communityMapRef.current) communityMapRef.current.invalidateSize();
+      console.log('Community map updated, position:', document.getElementById('community-map')?.getBoundingClientRect());
+    });
+  };
+
+  useEffect(() => {
+    localStorage.setItem('welcomePageVisited', 'true');
+    console.log('Welcome page visited, flag set');
+
+    const fetchAndDisplayOutlook = async () => {
+      try {
+        const currentDate = new Date().toISOString().split('T')[0]; // 2025-06-27
+        const snapshot = await db.collection('outlooks').where('date', '>=', currentDate).get();
+        const outlooks = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt || Date.now())
+        }));
+        console.log('Fetched outlooks:', outlooks);
+
+        if (!outlooks.length) {
+          setError('No forecasts available for today or future');
+          return;
+        }
+
+        const averagedScores = outlooks.reduce((acc, curr) => {
+          const { username, score } = curr;
+          if (!username) {
+            console.warn('Outlook missing username:', curr.id, curr);
+            return acc;
           }
-        }, 100);
+          acc[username] = acc[username] || { total: 0, count: 0, outlooks: [] };
+          acc[username].outlooks.push(curr);
+          if (score != null && !isNaN(score)) {
+            acc[username].total += score;
+            acc[username].count += 1;
+          }
+          return acc;
+        }, {});
+
+        const sortedUsers = Object.entries(averagedScores).map(([username, data]) => ({
+          username,
+          avgScore: data.count > 0 ? data.total / data.count : 0,
+          outlookCount: data.outlooks.length
+        })).sort((a, b) => (a.avgScore === b.avgScore ? b.outlookCount - a.outlookCount : b.avgScore - a.avgScore));
+
+        let selectedOutlook = null, selectedUsername = null;
+        if (sortedUsers.length) {
+          const topUser = sortedUsers[0].username;
+          const userOutlooks = averagedScores[topUser].outlooks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+          selectedOutlook = userOutlooks[0];
+          selectedUsername = topUser;
+        } else {
+          selectedOutlook = outlooks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+          selectedUsername = selectedOutlook.username || 'Unknown';
+        }
+
+        if (!selectedOutlook) {
+          setError('No valid forecast available to display');
+          return;
+        }
+
+        setSelectedUsername(selectedUsername);
+        setSelectedOutlook(selectedOutlook);
+        initializeCommunityMap();
+        initializeForecasterMap(selectedOutlook);
+
+        const initialDate = await getNextAvailableDate(currentDate);
+        setCommunityDate(initialDate);
       } catch (err) {
-        console.error('Error initializing WelcomePage map:', err);
-        setError('Failed to initialize map');
+        console.error('Error fetching or displaying outlook:', err);
+        if (err.code === 'failed-precondition' && err.message.includes('index')) {
+          setError('Database index required. Please contact the administrator.');
+        } else {
+          setError(`Failed to load forecast data: ${err.message}`);
+        }
       }
     };
 
-    const formatTimestamp = (timestamp) => {
-      if (!timestamp) return 'Unknown';
-      try {
-        const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
-        return date.toLocaleString('en-GB', {
-          day: '2-digit',
-          month: '2-digit',
-          year: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit',
-          timeZone: 'Europe/London'
-        });
-      } catch {
-        return 'Unknown';
+    fetchAndDisplayOutlook();
+
+    return () => {
+      if (communityMapRef.current) {
+        communityMapRef.current.remove();
+        communityMapRef.current = null;
+        communityMapInitialized.current = false;
+      }
+      if (forecasterMapRef.current) {
+        forecasterMapRef.current.remove();
+        forecasterMapRef.current = null;
+        forecasterMapInitialized.current = false;
       }
     };
+  }, []);
 
-    const formatValidityPeriod = (dateString) => {
-      if (!dateString) return 'Unknown';
-      try {
-        const forecastDate = new Date(dateString);
-        const nextDay = new Date(forecastDate);
-        nextDay.setDate(forecastDate.getDate() + 1);
-        return `${forecastDate.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' })} 06:00 - ${nextDay.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' })} 05:59`;
-      } catch {
-        return 'Unknown';
-      }
-    };
+  useEffect(() => {
+    console.log('Community date or cell size changed:', { communityDate, cellSize });
+    fetchCommunityOutlook(communityDate);
+  }, [communityDate, cellSize]);
 
-    const getVersion = (outlook) => {
-      return outlook?.version || 'Unknown';
-    };
+  const handleDateChange = (e) => {
+    const newDate = e.target.value;
+    console.log('Date picker selected:', newDate);
+    setCommunityDate(newDate);
+  };
 
-    return (
-      <div className="p-6 container mx-auto">
-        <h1 className="text-3xl font-bold text-gray-800 mb-4">Welcome to Convective Outlook</h1>
-        {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
-        <p className="text-gray-600 mb-4">
+  const handleCellSizeChange = (e) => {
+    const newCellSize = parseFloat(e.target.value);
+    console.log('Cell size changed:', newCellSize);
+    setCellSize(newCellSize);
+  };
+
+  const formatTimestamp = (timestamp) => {
+    if (!timestamp) return 'Unknown';
+    try {
+      const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+      return date.toLocaleString('en-GB', {
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London'
+      });
+    } catch {
+      return 'Unknown';
+    }
+  };
+
+  const formatValidityPeriod = (dateString) => {
+    if (!dateString) return 'Unknown';
+    try {
+      const forecastDate = new Date(dateString);
+      const nextDay = new Date(forecastDate);
+      nextDay.setDate(forecastDate.getDate() + 1);
+      return `${forecastDate.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' })} 06:00 - ${nextDay.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' })} 05:59`;
+    } catch {
+      return 'Unknown';
+    }
+  };
+
+  const getVersion = (outlook) => outlook?.version || 'Unknown';
+
+  return (
+  <div className="p-4 container mx-auto">
+    <h1 className="text-2xl md:text-3xl font-bold text-gray-800 mb-4">Welcome to Project Outcaster</h1>
+    {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
+    
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="bg-white p-4 rounded-lg shadow-md">
+        <h2 className="text-xl md:text-2xl font-semibold text-gray-700 mb-2">Community Outlook Map</h2>
+        <p className="text-gray-600 mb-2 max-w-md">
+          <span style={{ whiteSpace: 'nowrap' }}>Community forecast for 27/06/2025 06:00 - 28/06/2025 05:59</span><br />
+          Based on 4 user submissions
+        </p>
+        <div id="community-map" className="h-[300px] md:h-[500px] w-full rounded-lg shadow-md"></div>
+        <div className="mt-4">
+          
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-2">
+              <label htmlFor="community-date" className="text-gray-600">Select Date:</label>
+              <input
+                id="community-date"
+                type="date"
+                value={communityDate}
+                onChange={handleDateChange}
+                className="p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label htmlFor="resolution-slider" className="text-gray-600">Grid Resolution: {cellSize.toFixed(2)}°</label>
+              <input
+                id="resolution-slider"
+                type="range"
+                min="0.05"
+                max="0.5"
+                step="0.05"
+                value={cellSize}
+                onChange={handleCellSizeChange}
+                className="w-full md:w-1/2"
+              />
+            </div>
+          </div>
+          <p className="text-gray-600 mb-2 max-w-md">
+            <span style={{ whiteSpace: 'nowrap' }}>Community convective outlook based on users' submitted forecast </span><br />
+            and their forecasting accuracy
+          </p>
+        </div>
+      </div>
+      <div className="bg-white p-4 rounded-lg shadow-md">
+        <h2 className="text-xl md:text-2xl font-semibold text-gray-700 mb-2">Top Forecaster's Outlook Map</h2>
+        <p className="text-gray-600 mb-2 max-w-md">
           {selectedOutlook && selectedUsername ? (
             <>
               Viewing {selectedUsername}'s latest forecast, valid for{' '}
@@ -839,10 +1169,12 @@
             'No forecast selected'
           )}
         </p>
-        <div id="welcome-map" className="h-[500px] w-full rounded-lg shadow-md"></div>
+        <div id="welcome-map" className="h-[300px] md:h-[500px] w-full rounded-lg shadow-md"></div>
       </div>
-    );
-  };
+    </div>
+  </div>
+);
+};
 
     const CreateOutlookPage = ({ user, username, email }) => {
       const [drawnItems, setDrawnItems] = useState([]);
@@ -1188,7 +1520,7 @@
           return;
         }
         if (email !== 'admin@example.com') {
-          const currentDate = new Date('2025-06-26');
+          const currentDate = new Date().toISOString().split('T')[0]; 
           const selectedDateTime = new Date(forecastDate);
           if (selectedDateTime <= currentDate) {
             console.warn('Selected date is invalid or in the past:', forecastDate);
@@ -1427,7 +1759,7 @@
                 type="date"
                 value={forecastDate}
                 onChange={e => setForecastDate(e.target.value)}
-                min={email === 'admin@example.com' ? undefined : '2025-06-27'}
+                min={email === 'admin@example.com' ? undefined : new Date().toISOString().split('T')[0]}
                 className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
               <h2 className="text-xl font-semibold text-gray-700 mb-4">Risk Level</h2>
@@ -1789,821 +2121,1030 @@
     
     
     const YourUploadsPage = ({ user, username, email }) => {
-      const [outlooks, setOutlooks] = useState([]);
-      const [drafts, setDrafts] = useState([]);
-      const [selectedOutlook, setSelectedOutlook] = useState(null);
-      const [selectedDraftId, setSelectedDraftId] = useState('');
-      const [error, setError] = useState(null);
-      const [drawnItems, setDrawnItems] = useState([]);
-      const [riskLevel, setRiskLevel] = useState('low risk');
-      const [severeConditions, setSevereConditions] = useState({
-        rainfall: false,
-        hail: false,
-        tornado: false,
-        gusts: false
-      });
-      const [selectedPolygonId, setSelectedPolygonId] = useState(null);
-      const [sizeError, setSizeError] = useState(null);
-      const [forecastDate, setForecastDate] = useState('');
-      const [lightningStrikes, setLightningStrikes] = useState([]);
-      const [severeReports, setSevereReports] = useState([]);
-      const [showLightning, setShowLightning] = useState(true);
-      const [showSevereReports, setShowSevereReports] = useState(true);
-      const [showPast, setShowPast] = useState(false);
-      const mapRef = useRef(null);
-      const drawRef = useRef(null);
+  const [outlooks, setOutlooks] = useState([]);
+  const [drafts, setDrafts] = useState([]);
+  const [selectedOutlook, setSelectedOutlook] = useState(null);
+  const [selectedDraftId, setSelectedDraftId] = useState('');
+  const [error, setError] = useState(null);
+  const [drawnItems, setDrawnItems] = useState([]);
+  const [riskLevel, setRiskLevel] = useState('low risk');
+  const [severeConditions, setSevereConditions] = useState({
+    rainfall: false,
+    hail: false,
+    tornado: false,
+    gusts: false
+  });
+  const [selectedPolygonId, setSelectedPolygonId] = useState(null);
+  const [sizeError, setSizeError] = useState(null);
+  const [forecastDate, setForecastDate] = useState('');
+  const [lightningStrikes, setLightningStrikes] = useState([]);
+  const [severeReports, setSevereReports] = useState([]);
+  const [showLightning, setShowLightning] = useState(true);
+  const [showSevereReports, setShowSevereReports] = useState(true);
+  const [showPast, setShowPast] = useState(false);
+  const mapRef = useRef(null);
+  const drawRef = useRef(null);
 
-      const validatePolygonSizes = (polygons) => {
-        for (let i = 0; i < polygons.length; i++) {
-          const poly1 = polygons[i];
-          if (!poly1.geometry || !poly1.geometry.coordinates || !poly1.properties.Name) {
-            return `Error: Invalid polygon data at index ${i}`;
+  const validatePolygonSizes = (polygons) => {
+    for (let i = 0; i < polygons.length; i++) {
+      const poly1 = polygons[i];
+      if (!poly1.geometry || !poly1.geometry.coordinates || !poly1.properties.Name) {
+        return `Error: Invalid polygon data at index ${i}`;
+      }
+      if (poly1.properties.Name.toLowerCase() === 'severe risk') continue;
+      try {
+        const area1 = turf.area(turf.polygon(poly1.geometry.coordinates));
+        const riskIndex1 = RISK_ORDER.indexOf(poly1.properties.Name.toLowerCase());
+        for (let k = i + 1; k < polygons.length; k++) {
+          const poly2 = polygons[k];
+          if (!poly2.geometry || !poly2.geometry.coordinates) {
+            return `Error: Invalid polygon data at index ${k}`;
           }
-          if (poly1.properties.Name.toLowerCase() === 'severe risk') continue;
-          try {
-            const area1 = turf.area(turf.polygon(poly1.geometry.coordinates));
-            const riskIndex1 = RISK_ORDER.indexOf(poly1.properties.Name.toLowerCase());
-            for (let k = i + 1; k < polygons.length; k++) {
-              const poly2 = polygons[k];
-              if (!poly2.geometry || !poly2.geometry.coordinates) {
-                return `Error: Invalid polygon data at index ${k}`;
-              }
-              if (poly2.properties.Name.toLowerCase() === 'severe risk') continue;
-              const area2 = turf.area(turf.polygon(poly2.geometry.coordinates));
-              const riskIndex2 = RISK_ORDER.indexOf(poly2.properties.Name.toLowerCase());
-              if (riskIndex1 > riskIndex2 && area1 > area2) {
-                return `Error: ${poly1.properties.Name} area must be smaller than ${poly2.properties.Name} area.`;
-              }
-              if (riskIndex2 > riskIndex1 && area2 > area1) {
-                return `Error: ${poly2.properties.Name} area must be smaller than ${poly1.properties.Name} area.`;
-              }
-            }
-          } catch (err) {
-            console.error('Error in validatePolygonSizes:', err);
-            return `Error validating polygon sizes: ${err.message}`;
+          if (poly2.properties.Name.toLowerCase() === 'severe risk') continue;
+          const area2 = turf.area(turf.polygon(poly2.geometry.coordinates));
+          const riskIndex2 = RISK_ORDER.indexOf(poly2.properties.Name.toLowerCase());
+          if (riskIndex1 > riskIndex2 && area1 > area2) {
+            return `Error: ${poly1.properties.Name} area must be smaller than ${poly2.properties.Name} area.`;
+          }
+          if (riskIndex2 > riskIndex1 && area2 > area1) {
+            return `Error: ${poly2.properties.Name} area must be smaller than ${poly1.properties.Name} area.`;
           }
         }
-        return null;
-      };
+      } catch (err) {
+        console.error('Error in validatePolygonSizes:', err);
+        return `Error validating polygon sizes: ${err.message}`;
+      }
+    }
+    return null;
+  };
 
-      useEffect(() => {
-        waitForMapbox(() => {
-          try {
-            mapboxgl.accessToken = 'pk.eyJ1IjoiaGFuZHJ5MjAxOTEwMjYiLCJhIjoiY21jYWg2eG1lMDNkYTJxczVyOWM5bW9mciJ9.bA-qxiByTB_RseY1fgU4rg';
-            const map = new mapboxgl.Map({
-              container: 'uploads-map',
-              style: 'mapbox://styles/mapbox/streets-v11',
-              center: [-3, 54.5],
-              zoom: 6,
-              minZoom: 5,
-              maxBounds: [[-11, 49], [2, 61]]
-            });
-            mapRef.current = map;
+  const updateDrawnFeatures = () => {
+    console.log('Updating drawn features');
+    const features = drawRef.current.getAll().features;
+    features.forEach(feature => {
+      if (!feature.properties?.Name) {
+        feature.properties = {
+          Name: riskLevel,
+          color: RISK_COLORS[riskLevel],
+          severeConditions: riskLevel === 'severe risk' ? severeConditions : {}
+        };
+        console.log('Set properties for feature', feature.id, ':', feature.properties);
+      }
+    });
+    features.sort((a, b) => RISK_ORDER.indexOf(b.properties.Name.toLowerCase()) - RISK_ORDER.indexOf(a.properties.Name.toLowerCase()));
+    setDrawnItems(features);
+    if (mapRef.current.getSource('drawnFeatures')) {
+      mapRef.current.getSource('drawnFeatures').setData({
+        type: 'FeatureCollection',
+        features: features
+      });
+      console.log('Updated map source with features');
+    }
+  };
 
-            const draw = new MapboxDraw({
-              displayControlsDefault: false,
-              controls: {
-                polygon: true,
-                trash: true
-              },
-              defaultMode: 'draw_polygon',
-              styles: [
-                {
-                  id: 'gl-draw-polygon-fill-inactive',
-                  type: 'fill',
-                  filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon']],
-                  paint: {
-                    'fill-color': ['get', 'color'],
-                    'fill-opacity': ['case', ['==', ['get', 'Name'], 'severe risk'], 0, 0.4]
-                  }
-                },
-                {
-                  id: 'gl-draw-polygon-stroke-inactive',
-                  type: 'line',
-                  filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon']],
-                  paint: {
-                    'line-color': ['get', 'color'],
-                    'line-width': 2
-                  }
-                },
-                {
-                  id: 'gl-draw-polygon-fill-active',
-                  type: 'fill',
-                  filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
-                  paint: {
-                    'fill-color': ['get', 'color'],
-                    'fill-opacity': ['case', ['==', ['get', 'Name'], 'severe risk'], 0, 0.4]
-                  }
-                },
-                {
-                  id: 'gl-draw-polygon-stroke-active',
-                  type: 'line',
-                  filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
-                  paint: {
-                    'line-color': ['get', 'color'],
-                    'line-width': 3
-                  }
-                },
-                {
-                  id: 'gl-draw-polygon-midpoint',
-                  type: 'circle',
-                  filter: ['all', ['==', '$type', 'Point'], ['==', 'meta', 'midpoint']],
-                  paint: {
-                    'circle-radius': 3,
-                    'circle-color': '#fbb03b'
-                  }
-                },
-                {
-                  id: 'gl-draw-polygon-vertex-inactive',
-                  type: 'circle',
-                  filter: ['all', ['==', 'meta', 'vertex'], ['==', '$type', 'Point'], ['!=', 'mode', 'static']],
-                  paint: {
-                    'circle-radius': 5,
-                    'circle-color': '#fff'
-                  }
-                }
-              ]
-            });
-            map.addControl(draw);
-            drawRef.current = draw;
+  useEffect(() => {
+    waitForMapbox(() => {
+      try {
+        // Check if the container exists before initializing the map
+        const mapContainer = document.getElementById('Uploads-map');
+        if (!mapContainer) {
+          console.error('Map container "Uploads-map" not found in DOM');
+          setError('Map container not found. Please try refreshing the page.');
+          return;
+        }
 
-            map.on('draw.create', (e) => {
-              const feature = e.features[0];
-              feature.id = `poly-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-              feature.properties = {
-                Name: riskLevel,
-                color: RISK_COLORS[riskLevel],
-                severeConditions: riskLevel === 'severe risk' ? severeConditions : {}
-              };
-              const newItems = [...drawnItems, feature];
-              const validationError = validatePolygonSizes(newItems);
-              if (validationError) {
-                setSizeError(validationError);
-                draw.delete(feature.id);
+        mapboxgl.accessToken = 'pk.eyJ1IjoiaGFuZHJ5MjAxOTEwMjYiLCJhIjoiY21jYWg2eG1lMDNkYTJxczVyOWM5bW9mciJ9.bA-qxiByTB_RseY1fgU4rg';
+        
+        const map = new mapboxgl.Map({
+          container: 'Uploads-map',
+          style: 'mapbox://styles/mapbox/streets-v11',
+          center: [-3, 54.5],
+          zoom: 6,
+          minZoom: 3,
+          maxZoom: 10,
+          maxBounds: [[UK_BBOX[0], UK_BBOX[1]], [UK_BBOX[2], UK_BBOX[3]]]
+        });
+        mapRef.current = map;
+
+        map.on('load', () => {
+          map.resize();
+          console.log('Map resized after load');
+        });
+
+        const draw = new MapboxDraw({
+          displayControlsDefault: false,
+          controls: {
+            polygon: true,
+            trash: true
+          },
+          defaultMode: 'draw_polygon',
+          styles: [
+            {
+              id: 'gl-draw-polygon-fill-inactive',
+              type: 'fill',
+              filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon']],
+              paint: {
+                'fill-color': ['get', 'color'],
+                'fill-opacity': ['case', ['==', ['get', 'Name'], 'severe risk'], 0, 0.4]
+              }
+            },
+            {
+              id: 'gl-draw-polygon-stroke-inactive',
+              type: 'line',
+              filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon']],
+              paint: {
+                'line-color': ['get', 'color'],
+                'line-width': 2
+              }
+            },
+            {
+              id: 'gl-draw-polygon-fill-active',
+              type: 'fill',
+              filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
+              paint: {
+                'fill-color': ['get', 'color'],
+                'fill-opacity': ['case', ['==', ['get', 'Name'], 'severe risk'], 0, 0.4]
+              }
+            },
+            {
+              id: 'gl-draw-polygon-stroke-active',
+              type: 'line',
+              filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
+              paint: {
+                'line-color': ['get', 'color'],
+                'line-width': 3
+              }
+            },
+            {
+              id: 'gl-draw-polygon-midpoint',
+              type: 'circle',
+              filter: ['all', ['==', '$type', 'Point'], ['==', 'meta', 'midpoint']],
+              paint: {
+                'circle-radius': 3,
+                'circle-color': '#fbb03b'
+              }
+            },
+            {
+              id: 'gl-draw-polygon-vertex-inactive',
+              type: 'circle',
+              filter: ['all', ['==', 'meta', 'vertex'], ['==', '$type', 'Point'], ['!=', 'mode', 'static']],
+              paint: {
+                'circle-radius': 5,
+                'circle-color': '#fff'
+              }
+            }
+          ]
+        });
+        map.addControl(draw);
+        drawRef.current = draw;
+
+        map.on('draw.create', (e) => {
+          console.log('Draw create event:', e);
+          const feature = e.features[0];
+          feature.properties = {
+            Name: riskLevel,
+            color: RISK_COLORS[riskLevel],
+            severeConditions: riskLevel === 'severe risk' ? severeConditions : {}
+          };
+          console.log('Created feature', feature.id, 'with properties:', feature.properties);
+          const newItems = [...drawnItems, feature];
+          const validationError = validatePolygonSizes(newItems);
+          if (validationError) {
+            setSizeError(validationError);
+            draw.delete(feature.id);
+          } else {
+            setSizeError(null);
+            setDrawnItems(newItems);
+            setSelectedPolygonId(feature.id);
+          }
+          updateDrawnFeatures();
+        });
+
+        map.on('draw.update', updateDrawnFeatures);
+        map.on('draw.delete', () => {
+          updateDrawnFeatures();
+          setSelectedPolygonId(null);
+        });
+
+        map.on('draw.selectionchange', (e) => {
+          const selected = e.features[0]?.id;
+          setSelectedPolygonId(selected || null);
+          if (selected) {
+            const feature = drawRef.current.get(selected);
+            if (feature) {
+              setRiskLevel(feature.properties.Name);
+              if (feature.properties.Name === 'severe risk') {
+                setSevereConditions(feature.properties.severeConditions || {
+                  rainfall: false,
+                  hail: false,
+                  tornado: false,
+                  gusts: false
+                });
               } else {
-                setSizeError(null);
-                setDrawnItems(newItems);
-                setSelectedPolygonId(feature.id);
-                map.on('click', 'gl-draw-polygon-fill-inactive', (e) => {
-                  const clickedFeature = e.features[0];
-                  setSelectedPolygonId(clickedFeature.id);
-                  setRiskLevel(clickedFeature.properties.Name);
-                  setSevereConditions(clickedFeature.properties.severeConditions || {
-                    rainfall: false,
-                    hail: false,
-                    tornado: false,
-                    gusts: false
-                  });
+                setSevereConditions({
+                  rainfall: false,
+                  hail: false,
+                  tornado: false,
+                  gusts: false
                 });
               }
-            });
-
-            map.on('draw.update', () => {
-              const features = draw.getAll().features;
-              setDrawnItems(features);
-            });
-
-            map.on('draw.delete', () => {
-              const features = draw.getAll().features;
-              setDrawnItems(features);
-              setSelectedPolygonId(null);
-            });
-
-            map.on('load', () => {
-              map.addSource('drawnFeatures', {
-                type: 'geojson',
-                data: { type: 'FeatureCollection', features: [] }
-              });
-              map.addSource('lightning', {
-                type: 'geojson',
-                data: { type: 'FeatureCollection', features: [] }
-              });
-              map.addSource('severe-reports', {
-                type: 'geojson',
-                data: { type: 'FeatureCollection', features: [] }
-              });
-
-              map.addLayer({
-                id: 'lightning-points',
-                type: 'circle',
-                source: 'lightning',
-                paint: {
-                  'circle-radius': 5,
-                  'circle-color': '#ff0',
-                  'circle-opacity': 0.8
-                }
-              });
-
-              map.addLayer({
-                id: 'severe-reports-points',
-                type: 'circle',
-                source: 'severe-reports',
-                paint: {
-                  'circle-radius': 5,
-                  'circle-color': '#f00',
-                  'circle-opacity': 0.8
-                }
-              });
-            });
-
-            const fetchData = async () => {
-              try {
-                const outlookSnapshot = await db.collection('outlooks')
-                  .where('email', '==', email)
-                  .get();
-                const outlooksData = outlookSnapshot.docs.map(doc => ({
-                  id: doc.id,
-                  ...doc.data(),
-                  createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt)
-                }));
-                setOutlooks(outlooksData);
-
-                const draftSnapshot = await db.collection('drafts')
-                  .where('email', '==', email)
-                  .get();
-                const draftsData = draftSnapshot.docs.map(doc => ({
-                  id: doc.id,
-                  ...doc.data(),
-                  createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt)
-                }));
-                setDrafts(draftsData);
-              } catch (err) {
-                console.error('Error fetching data:', err);
-                setError('Failed to load your uploads');
-              }
-            };
-            fetchData();
-
-            return () => {
-              map.remove();
-            };
-          } catch (err) {
-            console.error('Error initializing map:', err);
-            setError('Failed to initialize map');
+              drawRef.current.changeMode('direct_select', { featureId: selected });
+            }
           }
         });
-      }, [email]);
 
-      useEffect(() => {
-        if (!mapRef.current || !selectedOutlook) return;
-        const map = mapRef.current;
-        if (map.getSource('drawnFeatures')) {
-          map.getSource('drawnFeatures').setData({
+        map.on('draw.modechange', (e) => {
+          console.log('Mode changed to:', e.mode);
+          if (e.mode === 'simple_select' && selectedPolygonId) {
+            drawRef.current.changeMode('direct_select', { featureId: selectedPolygonId });
+          }
+        });
+
+        map.on('load', () => {
+          map.addSource('drawnFeatures', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+          });
+          map.addSource('lightning', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+          });
+          map.addSource('severe-reports', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+          });
+
+          map.addLayer({
+            id: 'drawnPolygons',
+            type: 'fill',
+            source: 'drawnFeatures',
+            filter: ['!=', 'Name', 'severe risk'],
+            paint: {
+              'fill-color': ['get', 'color'],
+              'fill-opacity': [
+                'interpolate',
+                ['linear'],
+                ['zoom'],
+                3, 0.2,
+                10, 0.4
+              ]
+            }
+          });
+          map.addLayer({
+            id: 'drawnPolygonsOutline',
+            type: 'line',
+            source: 'drawnFeatures',
+            paint: {
+              'line-color': ['case', ['==', ['get', 'Name'], 'severe risk'], '#000000', ['get', 'color']],
+              'line-width': 2
+            }
+          });
+          map.addLayer({
+            id: 'drawnSeverePolygons',
+            type: 'fill',
+            source: 'drawnFeatures',
+            filter: ['==', 'Name', 'severe risk'],
+            paint: {
+              'fill-opacity': 0
+            }
+          });
+          map.addLayer({
+            id: 'lightning-points',
+            type: 'circle',
+            source: 'lightning',
+            paint: {
+              'circle-radius': 5,
+              'circle-color': '#ff0',
+              'circle-opacity': 0.8
+            }
+          });
+          map.addLayer({
+            id: 'severe-reports-points',
+            type: 'circle',
+            source: 'severe-reports',
+            paint: {
+              'circle-radius': 5,
+              'circle-color': '#f00',
+              'circle-opacity': 0.8
+            }
+          });
+        });
+
+        const fetchData = async () => {
+          try {
+            const outlookSnapshot = await db.collection('outlooks')
+              .where('email', '==', email)
+              .get();
+            const outlooksData = outlookSnapshot.docs.map(doc => ({
+              id: doc.id,
+              ...doc.data(),
+              createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt)
+            }));
+            setOutlooks(outlooksData);
+
+            const draftSnapshot = await db.collection('drafts')
+              .where('email', '==', email)
+              .get();
+            const draftsData = draftSnapshot.docs.map(doc => ({
+              id: doc.id,
+              ...doc.data(),
+              createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt)
+            }));
+            setDrafts(draftsData);
+          } catch (err) {
+            console.error('Error fetching data:', err);
+            setError('Failed to load your uploads');
+          }
+        };
+        fetchData();
+
+        return () => {
+          if (mapRef.current) {
+            mapRef.current.remove();
+            mapRef.current = null;
+          }
+        };
+      } catch (err) {
+        console.error('Error initializing map:', err);
+        setError('Failed to initialize map: ' + err.message);
+      }
+    });
+  }, [email]);
+
+  useEffect(() => {
+    if (!mapRef.current || !selectedOutlook) return;
+    const map = mapRef.current;
+    if (map.getSource('drawnFeatures')) {
+      map.getSource('drawnFeatures').setData({
+        type: 'FeatureCollection',
+        features: drawnItems
+      });
+    }
+  }, [drawnItems, selectedOutlook]);
+
+  useEffect(() => {
+    if (!mapRef.current || !selectedOutlook || !selectedOutlook.date) {
+      setSevereReports([]);
+      setLightningStrikes([]);
+      if (mapRef.current) {
+        if (mapRef.current.getSource('severe-reports')) {
+          mapRef.current.getSource('severe-reports').setData({
             type: 'FeatureCollection',
             features: []
           });
+          mapRef.current.setLayoutProperty('severe-reports-points', 'visibility', 'none');
         }
-
-        if (selectedOutlook.polygons) {
-          const parsedPolygons = selectedOutlook.polygons
-            .map(p => {
-              try {
-                return {
-                  ...p,
-                  geometry: {
-                    ...p.geometry,
-                    coordinates: JSON.parse(p.geometry.coordinates)
-                  },
-                  properties: {
-                    ...p.properties,
-                    Name: p.properties.Name || 'low risk',
-                    color: p.properties.color || RISK_COLORS[p.properties.Name?.toLowerCase() || 'low risk']
-                  }
-                };
-              } catch (err) {
-                console.error('Error parsing polygon:', p, err);
-                return null;
-              }
-            }).filter(p => p !== null);
-
-          const polygonsByRisk = RISK_ORDER.reduce((acc, risk) => {
-            acc[risk] = parsedPolygons.filter(p => p.properties.Name?.toLowerCase() === risk);
-            return acc;
-          }, {});
-
-          RISK_ORDER.forEach(risk => {
-            if (polygonsByRisk[risk].length) {
-              if (!map.getLayer(`${risk}-polygons`)) {
-                map.addLayer({
-                  id: `${risk}-polygons`,
-                  type: 'fill',
-                  source: {
-                    type: 'geojson',
-                    data: {
-                      type: 'FeatureCollection',
-                      features: polygonsByRisk[risk]
-                    }
-                  },
-                  paint: {
-                    'fill-color': ['get', 'color'],
-                    'fill-opacity': ['case', ['==', ['get', 'Name'], 'severe risk'], 0, 0.4]
-                  }
-                });
-                map.addLayer({
-                  id: `${risk}-outline`,
-                  type: 'line',
-                  source: {
-                    type: 'geojson',
-                    data: {
-                      type: 'FeatureCollection',
-                      features: polygonsByRisk[risk]
-                    }
-                  },
-                  paint: {
-                    'line-color': ['get', 'color'],
-                    'line-width': 2
-                  }
-                });
-              } else {
-                map.getSource(`${risk}-polygons`).setData({
-                  type: 'FeatureCollection',
-                  features: polygonsByRisk[risk]
-                });
-                map.getSource(`${risk}-outline`).setData({
-                  type: 'FeatureCollection',
-                  features: polygonsByRisk[risk]
-                });
-              }
-            }
+        if (mapRef.current.getSource('lightning')) {
+          mapRef.current.getSource('lightning').setData({
+            type: 'FeatureCollection',
+            features: []
           });
-
-          map.triggerRepaint();
+          mapRef.current.setLayoutProperty('lightning-points', 'visibility', 'none');
         }
-      }, [selectedOutlook]);
+      }
+      return;
+    }
 
-      useEffect(() => {
-        if (selectedOutlook && selectedOutlook.date && showPast) {
-          fetchLightningData(selectedOutlook.date, setError).then(strikes => {
-            setLightningStrikes(strikes);
-            if (mapRef.current.getSource('lightning')) {
-              mapRef.current.getSource('lightning').setData({
-                type: 'FeatureCollection',
-                features: strikes.map(s => ({
-                  type: 'Feature',
-                  geometry: {
-                    type: 'Point',
-                    coordinates: s.coordinates
-                  }
-                }))
-              });
-              mapRef.current.setLayoutProperty(
-                'lightning-points',
-                'visibility',
-                showLightning ? 'visible' : 'none'
-              );
-            }
-          });
+    // Toggle Mapbox Draw controls based on showPast
+    if (drawRef.current) {
+      if (showPast) {
+        drawRef.current.options.controls.polygon = false;
+        drawRef.current.options.controls.trash = false;
+        drawRef.current.changeMode('simple_select');
+      } else {
+        drawRef.current.options.controls.polygon = true;
+        drawRef.current.options.controls.trash = true;
+        drawRef.current.changeMode('draw_polygon');
+      }
+    }
 
-          db.collection('severe_reports')
-            .where('date', '==', selectedOutlook.date)
-            .get()
-            .then(snapshot => {
-              const reports = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-              setSevereReports(reports);
-              if (mapRef.current.getSource('severe-reports')) {
-                mapRef.current.getSource('severe-reports').setData({
-                  type: 'FeatureCollection',
-                  features: reports
-                    .filter(r => r.location && r.location.length === 2)
-                    .map(r => ({
-                      type: 'Feature',
-                      geometry: {
-                        type: 'Point',
-                        coordinates: r.location
-                      },
-                      properties: {
-                        condition: r.condition
-                      }
-                    }))
-                });
-                mapRef.current.setLayoutProperty(
-                  'severe-reports-points',
-                  'visibility',
-                  showSevereReports ? 'visible' : 'none'
-                );
+    const fetchSevereReports = async () => {
+      try {
+        const snapshot = await db.collection('severe_reports')
+          .where('date', '==', selectedOutlook.date)
+          .get();
+
+        const reports = snapshot.docs.map(doc => {
+          const data = doc.data();
+          return {
+            id: doc.id,
+            ...data,
+            createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : new Date(data.createdAt || Date.now()),
+            observedAt: data.observedAt ? new Date(data.observedAt) : null,
+            location: data.location && Array.isArray(data.location) && data.location.length === 2 ? data.location : null
+          };
+        });
+
+        console.log('Fetched severe reports:', reports);
+        setSevereReports(reports);
+
+        if (mapRef.current.getSource('severe-reports')) {
+          const validReports = reports.filter(r => r.location && Array.isArray(r.location) && r.location.length === 2);
+          mapRef.current.getSource('severe-reports').setData({
+            type: 'FeatureCollection',
+            features: validReports.map(r => ({
+              type: 'Feature',
+              geometry: {
+                type: 'Point',
+                coordinates: r.location
+              },
+              properties: {
+                condition: r.condition || 'Unknown',
+                createdBy: r.createdBy || 'Unknown',
+                createdAt: r.createdAt,
+                observedAt: r.observedAt
               }
-            })
-            .catch(err => {
-              console.error('Error fetching severe reports:', err);
-              setError('Failed to load severe reports');
-            });
+            }))
+          });
+          mapRef.current.setLayoutProperty(
+            'severe-reports-points',
+            'visibility',
+            showPast && showSevereReports ? 'visible' : 'none'
+          );
         }
-      }, [selectedOutlook, showLightning, showSevereReports, showPast]);
+      } catch (err) {
+        console.error('Error fetching severe reports:', err.message, err.code);
+        setError(`Failed to load severe reports: ${err.message}`);
+      }
+    };
 
-      const loadDraft = async (draftId) => {
-        const draft = drafts.find(d => d.id === draftId);
-        if (!draft) return;
-        setSelectedDraftId(draftId);
-        setForecastDate(draft.date);
-        const parsedPolygons = draft.polygons.map(p => ({
-          ...p,
-          geometry: {
-            ...p.geometry,
-            coordinates: JSON.parse(p.geometry.coordinates)
-          }
-        }));
-        setDrawnItems(parsedPolygons);
-        drawRef.current.deleteAll();
-        drawRef.current.set({
+    if (showPast) {
+      fetchLightningData(selectedOutlook.date, setError).then(strikes => {
+        setLightningStrikes(strikes);
+        if (mapRef.current.getSource('lightning')) {
+          mapRef.current.getSource('lightning').setData({
+            type: 'FeatureCollection',
+            features: strikes.map(s => ({
+              type: 'Feature',
+              geometry: {
+                type: 'Point',
+                coordinates: s.coordinates
+              }
+            }))
+          });
+          mapRef.current.setLayoutProperty(
+            'lightning-points',
+            'visibility',
+            showLightning ? 'visible' : 'none'
+          );
+        }
+      });
+      fetchSevereReports();
+    } else {
+      setLightningStrikes([]);
+      if (mapRef.current.getSource('lightning')) {
+        mapRef.current.getSource('lightning').setData({
           type: 'FeatureCollection',
-          features: parsedPolygons
+          features: []
         });
-        setSelectedPolygonId(null);
-        setRiskLevel('low risk');
-        setSevereConditions({
-          rainfall: false,
-          hail: false,
-          tornado: false,
-          gusts: false
+        mapRef.current.setLayoutProperty('lightning-points', 'visibility', 'none');
+      }
+      setSevereReports([]);
+      if (mapRef.current.getSource('severe-reports')) {
+        mapRef.current.getSource('severe-reports').setData({
+          type: 'FeatureCollection',
+          features: []
         });
-      };
+        mapRef.current.setLayoutProperty('severe-reports-points', 'visibility', 'none');
+      }
+    }
+  }, [selectedOutlook, showLightning, showSevereReports, showPast]);
 
-      const deleteDraft = async (draftId) => {
-        try {
-          await db.collection('drafts').doc(draftId).delete();
-          setDrafts(drafts.filter(d => d.id !== draftId));
-          if (selectedDraftId === draftId) {
-            setSelectedDraftId('');
-            drawRef.current.deleteAll();
-            setDrawnItems([]);
-            setForecastDate('');
-          }
-          alert('Draft deleted successfully');
-        } catch (err) {
-          console.error('Error deleting draft:', err);
-          setError('Failed to delete draft');
-        }
-      };
+  const loadDraft = async (draftId) => {
+    const draft = drafts.find(d => d.id === draftId);
+    if (!draft) return;
+    setSelectedDraftId(draftId);
+    setForecastDate(draft.date);
+    const parsedPolygons = draft.polygons.map(p => ({
+      ...p,
+      geometry: {
+        ...p.geometry,
+        coordinates: JSON.parse(p.geometry.coordinates)
+      }
+    }));
+    setDrawnItems(parsedPolygons);
+    drawRef.current.deleteAll();
+    parsedPolygons.forEach(feature => {
+      drawRef.current.add(feature);
+    });
+    setSelectedPolygonId(null);
+    setRiskLevel('low risk');
+    setSevereConditions({
+      rainfall: false,
+      hail: false,
+      tornado: false,
+      gusts: false
+    });
+  };
 
-      const submitDraft = async () => {
-        if (drawnItems.length === 0) {
-          alert('Please draw at least one polygon before submitting.');
-          return;
-        }
-        if (!forecastDate) {
-          alert('Please select a forecast date.');
-          return;
-        }
-        const validationError = validatePolygonSizes(drawnItems);
-        if (validationError) {
-          alert(`Validation error: ${validationError}`);
-          return;
-        }
-        try {
-          const serializedPolygons = drawnItems.map(polygon => ({
-            ...polygon,
-            geometry: {
-              ...polygon.geometry,
-              coordinates: JSON.stringify(polygon.geometry.coordinates)
-            },
-            properties: {
-              ...polygon.properties,
-              Name: polygon.properties.Name,
-              color: RISK_COLORS[polygon.properties.Name.toLowerCase()]
-            }
-          }));
-          const version = await getNextVersion('outlooks', email, forecastDate);
-          await db.collection('outlooks').add({
-            username,
-            email,
-            polygons: serializedPolygons,
-            date: forecastDate,
-            severeConditions: drawnItems.some(item => item.properties.Name === 'severe risk') ? severeConditions : {},
-            timestamp: firebase.firestore.FieldValue.serverTimestamp(),
-            score: null,
-            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-            version,
-            likes: []
-          });
-          if (selectedDraftId) {
-            await db.collection('drafts').doc(selectedDraftId).delete();
-            setDrafts(drafts.filter(d => d.id !== selectedDraftId));
-            setSelectedDraftId('');
-          }
-          setDrawnItems([]);
-          setSelectedPolygonId(null);
-          drawRef.current.deleteAll();
-          const outlookSnapshot = await db.collection('outlooks').where('email', '==', email).get();
-          setOutlooks(outlookSnapshot.docs.map(doc => ({
-            id: doc.id,
-            ...doc.data(),
-            createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt)
-          })));
-          alert('Draft submitted successfully!');
-        } catch (err) {
-          console.error('Error submitting draft:', err);
-          setError('Failed to submit draft');
-        }
-      };
+  const deleteDraft = async (draftId) => {
+    try {
+      await db.collection('drafts').doc(draftId).delete();
+      setDrafts(drafts.filter(d => d.id !== draftId));
+      if (selectedDraftId === draftId) {
+        setSelectedDraftId('');
+        drawRef.current.deleteAll();
+        setDrawnItems([]);
+        setForecastDate('');
+      }
+      alert('Draft deleted successfully');
+    } catch (err) {
+      console.error('Error deleting draft:', err);
+      setError('Failed to delete draft');
+    }
+  };
 
-      const updateOutlook = async () => {
-        if (!selectedOutlook || drawnItems.length === 0) {
-          alert('Please draw at least one polygon to update the forecast.');
-          return;
+  const submitDraft = async () => {
+    if (drawnItems.length === 0) {
+      alert('Please draw at least one polygon before submitting.');
+      return;
+    }
+    if (!forecastDate) {
+      alert('Please select a forecast date.');
+      return;
+    }
+    const validationError = validatePolygonSizes(drawnItems);
+    if (validationError) {
+      alert(`Validation error: ${validationError}`);
+      return;
+    }
+    try {
+      const serializedPolygons = drawnItems.map(polygon => ({
+        ...polygon,
+        geometry: {
+          ...polygon.geometry,
+          coordinates: JSON.stringify(polygon.geometry.coordinates)
+        },
+        properties: {
+          ...polygon.properties,
+          Name: polygon.properties.Name,
+          color: RISK_COLORS[polygon.properties.Name.toLowerCase()]
         }
-        const validationError = validatePolygonSizes(drawnItems);
-        if (validationError) {
-          alert(`Validation error: ${validationError}`);
-          return;
+      }));
+      const version = await getNextVersion('outlooks', email, forecastDate);
+      await db.collection('outlooks').add({
+        username,
+        email,
+        polygons: serializedPolygons,
+        date: forecastDate,
+        severeConditions: drawnItems.some(item => item.properties.Name === 'severe risk') ? severeConditions : {},
+        timestamp: firebase.firestore.FieldValue.serverTimestamp(),
+        score: null,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        version,
+        likes: []
+      });
+      if (selectedDraftId) {
+        await db.collection('drafts').doc(selectedDraftId).delete();
+        setDrafts(drafts.filter(d => d.id !== selectedDraftId));
+        setSelectedDraftId('');
+      }
+      setDrawnItems([]);
+      setSelectedPolygonId(null);
+      drawRef.current.deleteAll();
+      const outlookSnapshot = await db.collection('outlooks').where('email', '==', email).get();
+      setOutlooks(outlookSnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt)
+      })));
+      alert('Draft submitted successfully!');
+    } catch (err) {
+      console.error('Error submitting draft:', err);
+      setError('Failed to submit draft');
+    }
+  };
+
+  const updateOutlook = async () => {
+    if (!selectedOutlook || drawnItems.length === 0) {
+      alert('Please draw at least one polygon to update the forecast.');
+      return;
+    }
+    const validationError = validatePolygonSizes(drawnItems);
+    if (validationError) {
+      alert(`Validation error: ${validationError}`);
+      return;
+    }
+    try {
+      const serializedPolygons = drawnItems.map(polygon => ({
+        ...polygon,
+        geometry: {
+          ...polygon.geometry,
+          coordinates: JSON.stringify(polygon.geometry.coordinates)
+        },
+        properties: {
+          ...polygon.properties,
+          Name: polygon.properties.Name,
+          color: RISK_COLORS[polygon.properties.Name.toLowerCase()]
         }
-        try {
-          const serializedPolygons = drawnItems.map(polygon => ({
-            ...polygon,
-            geometry: {
-              ...polygon.geometry,
-              coordinates: JSON.stringify(polygon.geometry.coordinates)
-            },
-            properties: {
-              ...polygon.properties,
-              Name: polygon.properties.Name,
-              color: RISK_COLORS[polygon.properties.Name.toLowerCase()]
-            }
-          }));
-          await db.collection('outlooks').doc(selectedOutlook.id).update({
-            polygons: serializedPolygons,
-            severeConditions: drawnItems.some(item => item.properties.Name === 'severe risk') ? severeConditions : {},
-            timestamp: firebase.firestore.FieldValue.serverTimestamp()
-          });
-          setDrawnItems([]);
-          setSelectedPolygonId(null);
-          drawRef.current.deleteAll();
-          const outlookSnapshot = await db.collection('outlooks').where('email', '==', email).get();
-          setOutlooks(outlookSnapshot.docs.map(doc => ({
-            id: doc.id,
-            ...doc.data(),
-            createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt)
-          })));
-          setSelectedOutlook(null);
-          alert('Forecast updated successfully!');
-        } catch (err) {
-          console.error('Error updating outlook:', err);
-          setError('Failed to update forecast');
-        }
-      };
+      }));
+      await db.collection('outlooks').doc(selectedOutlook.id).update({
+        polygons: serializedPolygons,
+        severeConditions: drawnItems.some(item => item.properties.Name === 'severe risk') ? severeConditions : {},
+        timestamp: firebase.firestore.FieldValue.serverTimestamp()
+      });
+      setDrawnItems([]);
+      setSelectedPolygonId(null);
+      drawRef.current.deleteAll();
+      const outlookSnapshot = await db.collection('outlooks').where('email', '==', email).get();
+      setOutlooks(outlookSnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt)
+      })));
+      setSelectedOutlook(null);
+      alert('Forecast updated successfully!');
+    } catch (err) {
+      console.error('Error updating outlook:', err);
+      setError('Failed to update forecast');
+    }
+  };
 
-      const updateRiskLevel = (newRiskLevel) => {
-        setRiskLevel(newRiskLevel);
-        if (selectedPolygonId) {
-          const updatedFeatures = drawRef.current.getAll().features.map(feature => {
-            if (feature.id === selectedPolygonId) {
-              return {
-                ...feature,
-                properties: {
-                  ...feature.properties,
-                  Name: newRiskLevel,
-                  color: RISK_COLORS[newRiskLevel],
-                  severeConditions: newRiskLevel === 'severe risk' ? severeConditions : {}
-                }
-              };
-            }
-            return feature;
-          });
-          drawRef.current.set({
-            type: 'FeatureCollection',
-            features: updatedFeatures
-          });
-          setDrawnItems(updatedFeatures);
-        }
-      };
+  const updateRiskLevel = (newRiskLevel) => {
+    console.log('Updating risk level to:', newRiskLevel);
+    setRiskLevel(newRiskLevel);
+    if (selectedPolygonId) {
+      const feature = drawRef.current.get(selectedPolygonId);
+      if (feature) {
+        drawRef.current.setFeatureProperty(selectedPolygonId, 'Name', newRiskLevel);
+        drawRef.current.setFeatureProperty(selectedPolygonId, 'color', RISK_COLORS[newRiskLevel]);
+        drawRef.current.setFeatureProperty(selectedPolygonId, 'severeConditions', newRiskLevel === 'severe risk' ? severeConditions : {});
+        console.log('Updated feature', selectedPolygonId, 'to', newRiskLevel);
+        updateDrawnFeatures();
+      }
+    }
+  };
 
-      const updateSevereConditions = (newConditions) => {
-        setSevereConditions(newConditions);
-        if (selectedPolygonId && riskLevel === 'severe risk') {
-          const updatedFeatures = drawRef.current.getAll().features.map(feature => {
-            if (feature.id === selectedPolygonId) {
-              return {
-                ...feature,
-                properties: {
-                  ...feature.properties,
-                  severeConditions: newConditions
-                }
-              };
-            }
-            return feature;
-          });
-          drawRef.current.set({
-            type: 'FeatureCollection',
-            features: updatedFeatures
-          });
-          setDrawnItems(updatedFeatures);
-        }
-      };
+  const updateSevereConditions = (newConditions) => {
+    console.log('Updating severe conditions:', newConditions);
+    setSevereConditions(newConditions);
+    if (selectedPolygonId && riskLevel === 'severe risk') {
+      drawRef.current.setFeatureProperty(selectedPolygonId, 'severeConditions', newConditions);
+      console.log('Updated severe conditions for feature', selectedPolygonId);
+      updateDrawnFeatures();
+    }
+  };
 
-      const handleSevereChange = (e) => {
-        const newConditions = {
-          ...severeConditions,
-          [e.target.name]: e.target.checked
-        };
-        updateSevereConditions(newConditions);
-      };
+  const handleSevereChange = (e) => {
+    console.log('Handling severe change:', e.target.name, e.target.checked);
+    const newConditions = {
+      ...severeConditions,
+      [e.target.name]: e.target.checked
+    };
+    updateSevereConditions(newConditions);
+  };
 
-      const formatTimestamp = (timestamp) => {
-        if (!timestamp) return 'Unknown';
-        try {
-          const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
-          return date.toLocaleString('en-GB', {
-            day: '2-digit',
-            month: '2-digit',
-            year: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit',
-            timeZone: 'Europe/London'
-          });
-        } catch {
-          return 'Unknown';
-        }
-      };
+  const clearPolygons = () => {
+    console.log('Clearing polygons');
+    setDrawnItems([]);
+    setSelectedPolygonId(null);
+    setSelectedDraftId('');
+    setForecastDate('');
+    setRiskLevel('low risk');
+    setSevereConditions({
+      rainfall: false,
+      hail: false,
+      tornado: false,
+      gusts: false
+    });
+    drawRef.current.deleteAll();
+    setSizeError(null);
+    if (mapRef.current.getSource('drawnFeatures')) {
+      mapRef.current.getSource('drawnFeatures').setData({
+        type: 'FeatureCollection',
+        features: []
+      });
+      console.log('Cleared map source');
+    }
+  };
 
-      const displayedOutlooks = showPast
-        ? outlooks.filter(outlook => outlook.date < '2025-06-26')
-        : outlooks.filter(outlook => outlook.date >= '2025-06-26');
+  const formatTimestamp = (timestamp) => {
+    if (!timestamp) return 'Unknown';
+    try {
+      const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+      return date.toLocaleString('en-GB', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'Europe/London'
+      });
+    } catch {
+      return 'Unknown';
+    }
+  };
 
-      return (
-        <div className="p-6 container mx-auto">
-          <h1 className="text-3xl font-bold text-gray-800 mb-6">Your Uploads</h1>
-          {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
-          {sizeError && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{sizeError}</p>}
-          <div className="flex flex-col md:flex-row gap-6">
-            <div className="md:w-1/3 bg-white p-6 rounded-lg shadow-md">
-              <button
-                onClick={() => setShowPast(!showPast)}
-                className="mb-4 bg-gray-600 text-white p-2 rounded-lg hover:bg-gray-700 transition"
-              >
-                {showPast ? 'Show Future Forecasts' : 'Show Past Forecasts'}
-              </button>
-              <h2 className="text-xl font-semibold text-gray-700 mb-4">
-                {showPast ? 'Past Forecasts' : 'Future Forecasts'}
-              </h2>
-              <ul className="space-y-2 mb-4 max-h-60 overflow-y-auto">
-                {displayedOutlooks.map(outlook => (
-                  <li
-                    key={outlook.id}
-                    onClick={() => {
-                      setSelectedOutlook(outlook);
-                      setSelectedDraftId('');
-                      drawRef.current.deleteAll();
-                      setDrawnItems([]);
-                      setForecastDate('');
-                      if (!showPast && outlook.date >= '2025-06-26') {
-                        drawRef.current.set({
-                          type: 'FeatureCollection',
-                          features: outlook.polygons.map(p => ({
-                            ...p,
-                            geometry: {
-                              ...p.geometry,
-                              coordinates: JSON.parse(p.geometry.coordinates)
-                            }
-                          }))
-                        });
-                        setDrawnItems(outlook.polygons.map(p => ({
-                          ...p,
-                          geometry: {
-                            ...p.geometry,
-                            coordinates: JSON.parse(p.geometry.coordinates)
-                          }
-                        })));
+  const currentDate = new Date().toISOString().split('T')[0];
+  const displayedOutlooks = showPast
+    ? outlooks.filter(outlook => outlook.date < currentDate)
+    : outlooks.filter(outlook => outlook.date >= currentDate);
+
+  return (
+    <div className="p-6 container mx-auto">
+      <h1 className="text-3xl font-bold text-gray-800 mb-6">Your Uploads</h1>
+      {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
+      {sizeError && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{sizeError}</p>}
+      <div className="flex flex-col md:flex-row gap-6">
+        <div className="md:w-1/3 bg-white p-6 rounded-lg shadow-md">
+          <button
+            onClick={() => setShowPast(!showPast)}
+            className="mb-4 bg-gray-600 text-white p-2 rounded-lg hover:bg-gray-700 transition"
+          >
+            {showPast ? 'Show Future Forecasts' : 'Show Past Forecasts'}
+          </button>
+          <h2 className="text-xl font-semibold text-gray-700 mb-4">
+            {showPast ? 'Past Forecasts' : 'Future Forecasts'}
+          </h2>
+          <ul className="space-y-2 mb-4 max-h-60 overflow-y-auto">
+            {displayedOutlooks.map(outlook => (
+              <li
+                key={outlook.id}
+                onClick={() => {
+                  setSelectedOutlook(outlook);
+                  setSelectedDraftId('');
+                  drawRef.current.deleteAll();
+                  setDrawnItems([]);
+                  setForecastDate(outlook.date);
+                  try {
+                    const parsedPolygons = outlook.polygons.map(p => ({
+                      ...p,
+                      geometry: {
+                        ...p.geometry,
+                        coordinates: JSON.parse(p.geometry.coordinates)
                       }
+                    }));
+                    drawRef.current.deleteAll();
+                    parsedPolygons.forEach(feature => {
+                      drawRef.current.add(feature);
+                    });
+                    setDrawnItems(parsedPolygons);
+                    setSelectedPolygonId(null);
+                    setRiskLevel('low risk');
+                    setSevereConditions({
+                      rainfall: false,
+                      hail: false,
+                      tornado: false,
+                      gusts: false
+                    });
+                  } catch (err) {
+                    console.error('Error loading polygons for outlook:', outlook.id, err);
+                    setError('Failed to load polygons for the selected forecast');
+                  }
+                }}
+                className="cursor-pointer p-3 hover:bg-gray-100 rounded-lg"
+              >
+                {outlook.date} {outlook.version} (Score: {outlook.score != null ? outlook.score.toFixed(2) : 'Pending'})
+                <br />
+                Published: {formatTimestamp(outlook.createdAt)}
+              </li>
+            ))}
+          </ul>
+          <h2 className="text-xl font-semibold text-gray-700 mb-4">Your Drafts</h2>
+          <select
+            value={selectedDraftId}
+            onChange={e => loadDraft(e.target.value)}
+            className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="">Select a Draft</option>
+            {drafts.map(draft => (
+              <option key={draft.id} value={draft.id}>{draft.name} ({draft.date})</option>
+            ))}
+          </select>
+          {selectedDraftId && (
+            <>
+              <h2 className="text-xl font-semibold text-gray-700 mb-4">Edit Draft</h2>
+              <input
+                type="date"
+                value={forecastDate}
+                onChange={e => setForecastDate(e.target.value)}
+                min={email === 'admin@example.com' ? undefined : new Date().toISOString().split('T')[0]}
+                className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <h2 className="text-xl font-semibold text-gray-700 mb-4">Risk Level</h2>
+              <select
+                value={riskLevel}
+                onChange={e => updateRiskLevel(e.target.value)}
+                className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                {RISK_ORDER.map(risk => (
+                  <option key={risk} value={risk}>{risk.charAt(0).toUpperCase() + risk.slice(1)}</option>
+                ))}
+              </select>
+              {riskLevel === 'severe risk' && selectedPolygonId && (
+                <>
+                  <h2 className="text-xl font-semibold text-gray-700 mb-4">Severe Conditions</h2>
+                  {['rainfall', 'hail', 'tornado', 'gusts'].map(condition => (
+                    <label key={condition} className="flex items-center mb-2">
+                      <input
+                        type="checkbox"
+                        name={condition}
+                        checked={severeConditions[condition]}
+                        onChange={handleSevereChange}
+                        className="mr-2 h-5 w-5 text-blue-600"
+                      />
+                      <span className="text-gray-600">
+                        {condition.charAt(0).toUpperCase() + condition.slice(1)}
+                        {condition === 'rainfall' && ' (>25mm/3hr)'}
+                        {condition === 'hail' && ' (>2cm)'}
+                        {condition === 'tornado' && ''}
+                        {condition === 'gusts' && ' (>55mph)'}
+                      </span>
+                    </label>
+                  ))}
+                </>
+              )}
+              <h2 className="text-xl font-semibold text-gray-700 mb-4">Drawn Polygons</h2>
+              <ul className="space-y-2 mb-4 max-h-60 overflow-y-auto">
+                {drawnItems.map(item => (
+                  <li
+                    key={item.id}
+                    className={`p-2 cursor-pointer rounded-lg ${selectedPolygonId === item.id ? 'bg-blue-100' : 'hover:bg-gray-100'}`}
+                    onClick={() => {
+                      setSelectedPolygonId(item.id);
+                      setRiskLevel(item.properties.Name);
+                      setSevereConditions(item.properties.severeConditions || {
+                        rainfall: false,
+                        hail: false,
+                        tornado: false,
+                        gusts: false
+                      });
+                      drawRef.current.changeMode('direct_select', { featureId: item.id });
                     }}
-                    className="cursor-pointer p-3 hover:bg-gray-100 rounded-lg"
                   >
-                    {outlook.date} {outlook.version} (Score: {outlook.score != null ? outlook.score.toFixed(2) : 'Pending'})
-                    <br />
-                    Published: {formatTimestamp(outlook.createdAt)}
+                    {item.properties.Name} (ID: {item.id.slice(0, 8)})
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        drawRef.current.delete(item.id);
+                        setDrawnItems(drawnItems.filter(i => i.id !== item.id));
+                        setSelectedPolygonId(null);
+                      }}
+                      className="ml-2 text-red-500 hover:text-red-700"
+                    >
+                      Delete
+                    </button>
                   </li>
                 ))}
               </ul>
-              <h2 className="text-xl font-semibold text-gray-700 mb-4">Your Drafts</h2>
+              <div className="flex space-x-4">
+                <button
+                  onClick={submitDraft}
+                  className="bg-blue-600 text-white p-3 rounded-lg hover:bg-blue-700 transition disabled:bg-blue-400"
+                  disabled={sizeError}
+                >
+                  Submit Draft
+                </button>
+                <button
+                  onClick={() => deleteDraft(selectedDraftId)}
+                  className="bg-red-600 text-white p-3 rounded-lg hover:bg-red-700 transition"
+                >
+                  Delete Draft
+                </button>
+                <button
+                  onClick={clearPolygons}
+                  className="bg-red-600 text-white p-3 rounded-lg hover:bg-red-700 transition"
+                >
+                  Clear Polygons
+                </button>
+              </div>
+            </>
+          )}
+          {selectedOutlook && !showPast && selectedOutlook.date >= new Date().toISOString().split('T')[0] && (
+            <>
+              <h2 className="text-xl font-semibold text-gray-700 mt-4 mb-4">Edit Forecast</h2>
+              <input
+                type="date"
+                value={forecastDate}
+                onChange={e => setForecastDate(e.target.value)}
+                min={email === 'admin@example.com' ? undefined : new Date().toISOString().split('T')[0]}
+                className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <h2 className="text-xl font-semibold text-gray-700 mb-4">Risk Level</h2>
               <select
-                value={selectedDraftId}
-                onChange={e => loadDraft(e.target.value)}
+                value={riskLevel}
+                onChange={e => updateRiskLevel(e.target.value)}
                 className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
-                <option value="">Select a Draft</option>
-                {drafts.map(draft => (
-                  <option key={draft.id} value={draft.id}>{draft.name} ({draft.date})</option>
+                {RISK_ORDER.map(risk => (
+                  <option key={risk} value={risk}>{risk.charAt(0).toUpperCase() + risk.slice(1)}</option>
                 ))}
               </select>
-              {selectedDraftId && (
+              {riskLevel === 'severe risk' && selectedPolygonId && (
                 <>
-                  <h2 className="text-xl font-semibold text-gray-700 mb-4">Edit Draft</h2>
-                  <input
-                    type="date"
-                    value={forecastDate}
-                    onChange={e => setForecastDate(e.target.value)}
-                    min={email === 'admin@example.com' ? undefined : new Date().toISOString().split('T')[0]}
-                    className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  />
-                  <select
-                    value={riskLevel}
-                    onChange={e => updateRiskLevel(e.target.value)}
-                    className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  >
-                    {RISK_ORDER.map(risk => (
-                      <option key={risk} value={risk}>{risk.charAt(0).toUpperCase() + risk.slice(1)}</option>
-                    ))}
-                  </select>
-                  {riskLevel === 'severe risk' && selectedPolygonId && (
-                    <>
-                      <h2 className="text-xl font-semibold text-gray-700 mb-4">Severe Conditions</h2>
-                      {['rainfall', 'hail', 'tornado', 'gusts'].map(condition => (
-                        <label key={condition} className="flex items-center mb-2">
-                          <input
-                            type="checkbox"
-                            name={condition}
-                            checked={severeConditions[condition]}
-                            onChange={handleSevereChange}
-                            className="mr-2 h-5 w-5 text-blue-600"
-                          />
-                          <span className="text-gray-600">
-                            {condition.charAt(0).toUpperCase() + condition.slice(1)}
-                            {condition === 'rainfall' && ' (>25mm/3hr)'}
-                            {condition === 'hail' && ' (>2cm)'}
-                            {condition === 'tornado' && ''}
-                            {condition === 'gusts' && ' (>55mph)'}
-                          </span>
-                        </label>
-                      ))}
-                    </>
-                  )}
-                  <ul className="space-y-2 mb-4 max-h-60 overflow-y-auto">
-                    {drawnItems.map(item => (
-                      <li
-                        key={item.id}
-                        className={`p-2 cursor-pointer rounded-lg ${selectedPolygonId === item.id ? 'bg-blue-100' : 'hover:bg-gray-100'}`}
-                        onClick={() => {
-                          setSelectedPolygonId(item.id);
-                          setRiskLevel(item.properties.Name);
-                          setSevereConditions(item.properties.severeConditions || {
-                            rainfall: false,
-                            hail: false,
-                            tornado: false,
-                            gusts: false
-                          });
-                        }}
-                      >
-                        {item.properties.Name} (ID: {item.id.slice(0, 8)})
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            drawRef.current.delete(item.id);
-                            setDrawnItems(drawnItems.filter(i => i.id !== item.id));
-                            setSelectedPolygonId(null);
-                          }}
-                          className="ml-2 text-red-500 hover:text-red-700"
-                        >
-                          Delete
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                  <div className="flex space-x-4">
-                    <button
-                      onClick={submitDraft}
-                      className="bg-blue-600 text-white p-3 rounded-lg hover:bg-blue-700 transition"
-                    >
-                      Submit Draft
-                    </button>
-                    <button
-                      onClick={() => deleteDraft(selectedDraftId)}
-                      className="bg-red-600 text-white p-3 rounded-lg hover:bg-red-700 transition"
-                    >
-                      Delete Draft
-                    </button>
-                  </div>
+                  <h2 className="text-xl font-semibold text-gray-700 mb-4">Severe Conditions</h2>
+                  {['rainfall', 'hail', 'tornado', 'gusts'].map(condition => (
+                    <label key={condition} className="flex items-center mb-2">
+                      <input
+                        type="checkbox"
+                        name={condition}
+                        checked={severeConditions[condition]}
+                        onChange={handleSevereChange}
+                        className="mr-2 h-5 w-5 text-blue-600"
+                      />
+                      <span className="text-gray-600">
+                        {condition.charAt(0).toUpperCase() + condition.slice(1)}
+                        {condition === 'rainfall' && ' (>25mm/3hr)'}
+                        {condition === 'hail' && ' (>2cm)'}
+                        {condition === 'tornado' && ''}
+                        {condition === 'gusts' && ' (>55mph)'}
+                      </span>
+                    </label>
+                  ))}
                 </>
               )}
-              {selectedOutlook && !showPast && selectedOutlook.date >= '2025-06-26' && (
+              <h2 className="text-xl font-semibold text-gray-700 mb-4">Drawn Polygons</h2>
+              <ul className="space-y-2 mb-4 max-h-60 overflow-y-auto">
+                {drawnItems.map(item => (
+                  <li
+                    key={item.id}
+                    className={`p-2 cursor-pointer rounded-lg ${selectedPolygonId === item.id ? 'bg-blue-100' : 'hover:bg-gray-100'}`}
+                    onClick={() => {
+                      setSelectedPolygonId(item.id);
+                      setRiskLevel(item.properties.Name);
+                      setSevereConditions(item.properties.severeConditions || {
+                        rainfall: false,
+                        hail: false,
+                        tornado: false,
+                        gusts: false
+                      });
+                      drawRef.current.changeMode('direct_select', { featureId: item.id });
+                    }}
+                  >
+                    {item.properties.Name} (ID: {item.id.slice(0, 8)})
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        drawRef.current.delete(item.id);
+                        setDrawnItems(drawnItems.filter(i => i.id !== item.id));
+                        setSelectedPolygonId(null);
+                      }}
+                      className="ml-2 text-red-500 hover:text-red-700"
+                    >
+                      Delete
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <div className="flex space-x-4">
                 <button
                   onClick={updateOutlook}
-                  className="mt-4 bg-green-600 text-white p-3 rounded-lg hover:bg-green-700 transition"
+                  className="bg-green-600 text-white p-3 rounded-lg hover:bg-green-700 transition disabled:bg-green-400"
+                  disabled={sizeError}
                 >
                   Update Forecast
                 </button>
-              )}
-              {showPast && (
-                <div className="mt-4">
-                  <button
-                    onClick={() => setShowLightning(!showLightning)}
-                    className="bg-yellow-500 text-white p-2 rounded-lg hover:bg-yellow-600 transition mr-2"
-                  >
-                    {showLightning ? 'Hide Lightning' : 'Show Lightning'}
-                  </button>
-                  <button
-                    onClick={() => setShowSevereReports(!showSevereReports)}
-                    className="bg-red-500 text-white p-2 rounded-lg hover:bg-red-600 transition"
-                  >
-                    {showSevereReports ? 'Hide Severe Reports' : 'Show Severe Reports'}
-                  </button>
-                </div>
-              )}
+                <button
+                  onClick={clearPolygons}
+                  className="bg-red-600 text-white p-3 rounded-lg hover:bg-red-700 transition"
+                >
+                  Clear Polygons
+                </button>
+              </div>
+            </>
+          )}
+          {showPast && (
+            <div className="mt-4">
+              <button
+                onClick={() => setShowLightning(!showLightning)}
+                className="bg-yellow-500 text-white p-2 rounded-lg hover:bg-yellow-600 transition mr-2"
+              >
+                {showLightning ? 'Hide Lightning' : 'Show Lightning'}
+              </button>
+              <button
+                onClick={() => setShowSevereReports(!showSevereReports)}
+                className="bg-red-500 text-white p-2 rounded-lg hover:bg-red-600 transition"
+              >
+                {showSevereReports ? 'Hide Severe Reports' : 'Show Severe Reports'}
+              </button>
             </div>
-            <div className="md:w-2/3">
-              <div id="uploads-map" className="h-[700px] w-full rounded-lg shadow-md"></div>
+          )}
+          {showPast && severeReports.length > 0 && (
+            <div className="mt-4">
+              <h2 className="text-xl font-semibold text-gray-700 mb-4">Severe Weather Reports</h2>
+              <ul className="space-y-2 max-h-60 overflow-y-auto">
+                {severeReports.map(report => (
+                  <li key={report.id} className="p-3 bg-gray-100 rounded-lg">
+                    {report.date} - {report.condition} at [{report.location ? report.location[1].toFixed(4) : 'N/A'}, {report.location ? report.location[0].toFixed(4) : 'N/A'}]
+                    <br />
+                    Created By: {report.createdBy || 'Unknown'}
+                    <br />
+                    Created: {formatTimestamp(report.createdAt)}
+                    <br />
+                    Observed: {report.observedAt ? report.observedAt.toLocaleString('en-GB') : 'Unknown'}
+                  </li>
+                ))}
+              </ul>
             </div>
-          </div>
+          )}
         </div>
-      );
-    };
+        <div className="md:w-2/3">
+          <div id="Uploads-map" className="h-[700px] w-full rounded-lg shadow-md"></div>
+        </div>
+      </div>
+    </div>
+  );
+};
     const AccountPage = () => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -2637,7 +3178,7 @@
 
   return (
     <div className="p-6 container mx-auto max-w-md">
-      <h1 className="text-3xl font-bold text-gray-800 mb-6">{isRegistering ? 'Register' : 'Login'}</h1>
+      <h1 className="text-3xl font-bold text-gray-800 mb-6">{isRegistering ? 'Register' : 'Login/ Join alpha test from https://forms.gle/QaFngRHgiGXTZd6E9'}</h1>
       {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
       <div className="bg-white p-6 rounded-lg shadow-md">
         {isRegistering && (
@@ -2676,7 +3217,7 @@
           onClick={handleAuth}
           className="w-full bg-blue-600 text-white p-3 rounded-lg hover:bg-blue-700 transition"
         >
-          Login
+          {isRegistering ? 'Register' : 'Login'}
         </button>
         
       </div>
@@ -2684,9 +3225,10 @@
   );
 };
 
-const AdminPage = () => {
+const AdminPage = ({ user }) => {
   const [severeReports, setSevereReports] = useState([]);
   const [date, setDate] = useState('');
+  const [observedTime, setObservedTime] = useState('');
   const [condition, setCondition] = useState('Rainfall');
   const [lat, setLat] = useState('');
   const [lon, setLon] = useState('');
@@ -2695,6 +3237,7 @@ const AdminPage = () => {
   const markerRef = useRef(null);
 
   useEffect(() => {
+    console.log('User prop:', user); // Debug user object
     waitForLeaflet(() => {
       try {
         const map = L.map('admin-map').setView([54.5, -3], 6);
@@ -2722,57 +3265,88 @@ const AdminPage = () => {
 
     db.collection('severe_reports')
       .get()
-      .then(snapshot => {
-        const reports = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      .then((snapshot) => {
+        const reports = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
         setSevereReports(reports);
       })
-      .catch(err => {
+      .catch((err) => {
         console.error('Error fetching severe reports:', err);
         setError('Failed to load severe reports');
       });
-  }, []);
+  }, [user]);
 
   const addSevereReport = async () => {
-    if (!date || !lat || !lon || !condition) {
-      setError('Please fill in all fields');
-      return;
-    }
-    try {
-      await db.collection('severe_reports').add({
+  if (!date || !observedTime || !lat || !lon || !condition) {
+    setError('Please fill in all fields');
+    return;
+  }
+  if (!user) {
+    setError('You must be logged in to add a severe report');
+    return;
+  }
+  try {
+    const observedAt = new Date(`${date}T${observedTime}:00Z`).toISOString();
+    const createdBy = user.uid; // Use UID for consistency
+    await db.collection('severe_reports').add({
+      date,
+      condition,
+      location: [parseFloat(lon), parseFloat(lat)],
+      createdBy,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      observedAt,
+    });
+    setSevereReports([
+      ...severeReports,
+      {
         date,
         condition,
         location: [parseFloat(lon), parseFloat(lat)],
-        timestamp: firebase.firestore.FieldValue.serverTimestamp()
-      });
-      setSevereReports([...severeReports, {
-        date,
-        condition,
-        location: [parseFloat(lon), parseFloat(lat)],
-        timestamp: new Date()
-      }]);
-      setDate('');
-      setLat('');
-      setLon('');
-      setCondition('Rainfall');
-      if (markerRef.current) {
-        mapRef.current.removeLayer(markerRef.current);
-        markerRef.current = null;
-      }
-      alert('Severe report added successfully');
-    } catch (err) {
-      console.error('Error adding severe report:', err);
-      setError('Failed to add severe report');
+        createdBy: user.email || user.displayName || user.uid, // Display email or username in UI
+        createdAt: new Date(),
+        observedAt,
+      },
+    ]);
+    setDate('');
+    setObservedTime('');
+    setLat('');
+    setLon('');
+    setCondition('Rainfall');
+    if (markerRef.current) {
+      mapRef.current.removeLayer(markerRef.current);
+      markerRef.current = null;
     }
-  };
+    alert('Severe report added successfully');
+  } catch (err) {
+    console.error('Error adding severe report:', err);
+    setError('Failed to add severe report');
+  }
+};
 
   const deleteSevereReport = async (reportId) => {
     try {
       await db.collection('severe_reports').doc(reportId).delete();
-      setSevereReports(severeReports.filter(r => r.id !== reportId));
+      setSevereReports(severeReports.filter((r) => r.id !== reportId));
       alert('Severe report deleted successfully');
     } catch (err) {
       console.error('Error deleting severe report:', err);
       setError('Failed to delete severe report');
+    }
+  };
+
+  const formatTimestamp = (timestamp) => {
+    if (!timestamp) return 'Unknown';
+    try {
+      const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+      return date.toLocaleString('en-GB', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'Europe/London',
+      });
+    } catch {
+      return 'Unknown';
     }
   };
 
@@ -2788,7 +3362,16 @@ const AdminPage = () => {
             <input
               type="date"
               value={date}
-              onChange={e => setDate(e.target.value)}
+              onChange={(e) => setDate(e.target.value)}
+              className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div className="mb-4">
+            <label className="block text-gray-700 mb-2">Observed Time</label>
+            <input
+              type="time"
+              value={observedTime}
+              onChange={(e) => setObservedTime(e.target.value)}
               className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
           </div>
@@ -2796,10 +3379,10 @@ const AdminPage = () => {
             <label className="block text-gray-700 mb-2">Condition</label>
             <select
               value={condition}
-              onChange={e => setCondition(e.target.value)}
+              onChange={(e) => setCondition(e.target.value)}
               className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             >
-              {['Rainfall', 'Hail', 'Tornado', 'Gusts'].map(c => (
+              {['Rainfall', 'Hail', 'Tornado', 'Gusts'].map((c) => (
                 <option key={c} value={c}>{c}</option>
               ))}
             </select>
@@ -2809,7 +3392,7 @@ const AdminPage = () => {
             <input
               type="number"
               value={lat}
-              onChange={e => setLat(e.target.value)}
+              onChange={(e) => setLat(e.target.value)}
               placeholder="Click map to select"
               className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
@@ -2819,7 +3402,7 @@ const AdminPage = () => {
             <input
               type="number"
               value={lon}
-              onChange={e => setLon(e.target.value)}
+              onChange={(e) => setLon(e.target.value)}
               placeholder="Click map to select"
               className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
@@ -2832,9 +3415,22 @@ const AdminPage = () => {
           </button>
           <h2 className="text-xl font-semibold text-gray-700 mt-6 mb-4">Severe Reports</h2>
           <ul className="space-y-2 max-h-60 overflow-y-auto">
-            {severeReports.map(report => (
+            {severeReports.map((report) => (
               <li key={report.id} className="p-3 bg-gray-100 rounded-lg">
                 {report.date} - {report.condition} at [{report.location[1].toFixed(4)}, {report.location[0].toFixed(4)}]
+                <br />
+                Created By: {report.createdBy || 'Unknown'}
+                <br />
+                Created: {formatTimestamp(report.createdAt)}
+                <br />
+                Observed: {report.observedAt ? new Date(report.observedAt).toLocaleString('en-GB', {
+                  day: '2-digit',
+                  month: '2-digit',
+                  year: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  timeZone: 'Europe/London',
+                }) : 'Unknown'}
                 <button
                   onClick={() => deleteSevereReport(report.id)}
                   className="ml-2 text-red-500 hover:text-red-700"
@@ -2853,6 +3449,242 @@ const AdminPage = () => {
   );
 };
 
+
+const AddSevereReportPage = ({ user }) => {
+  const [severeReports, setSevereReports] = useState([]);
+  const [date, setDate] = useState('');
+  const [observedTime, setObservedTime] = useState('');
+  const [condition, setCondition] = useState('Rainfall');
+  const [lat, setLat] = useState('');
+  const [lon, setLon] = useState('');
+  const [error, setError] = useState(null);
+  const mapRef = useRef(null);
+  const markerRef = useRef(null);
+
+  useEffect(() => {
+    waitForLeaflet(() => {
+      try {
+        const map = L.map('severe-report-map').setView([54.5, -3], 6);
+        mapRef.current = map;
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        }).addTo(map).on('tileerror', error => {
+          console.error('Tile error:', error);
+          setError('Failed to load map tiles');
+        });
+        map.on('click', (e) => {
+          setLat(e.latlng.lat.toFixed(4));
+          setLon(e.latlng.lng.toFixed(4));
+          if (markerRef.current) {
+            map.removeLayer(markerRef.current);
+          }
+          markerRef.current = L.marker([e.latlng.lat, e.latlng.lng]).addTo(map);
+        });
+        setTimeout(() => {
+          map.invalidateSize();
+          console.log('Map size invalidated for AddSevereReportPage');
+        }, 100);
+
+        return () => {
+          console.log('Cleaning up AddSevereReportPage map');
+          map.remove();
+        };
+      } catch (err) {
+        console.error('Error initializing AddSevereReportPage map:', err);
+        setError('Failed to initialize map');
+      }
+    });
+
+    db.collection('severe_reports')
+      .where('createdBy', '==', user.uid)
+      .get()
+      .then((snapshot) => {
+        const reports = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt),
+          observedAt: doc.data().observedAt ? new Date(doc.data().observedAt) : null
+        }));
+        setSevereReports(reports);
+      })
+      .catch((err) => {
+        console.error('Error fetching severe reports:', err);
+        setError('Failed to load your severe reports');
+      });
+  }, [user]);
+
+  const addSevereReport = async () => {
+    if (!date || !observedTime || !lat || !lon || !condition) {
+      setError('Please fill in all fields');
+      return;
+    }
+    if (!user) {
+      setError('You must be logged in to add a severe report');
+      return;
+    }
+    try {
+      const observedAt = new Date(`${date}T${observedTime}:00Z`).toISOString();
+      const createdBy = user.uid;
+      await db.collection('severe_reports').add({
+        date,
+        condition,
+        location: [parseFloat(lon), parseFloat(lat)],
+        createdBy,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        observedAt
+      });
+      setSevereReports([
+        ...severeReports,
+        {
+          date,
+          condition,
+          location: [parseFloat(lon), parseFloat(lat)],
+          createdBy: user.email || user.displayName || user.uid,
+          createdAt: new Date(),
+          observedAt
+        }
+      ]);
+      setDate('');
+      setObservedTime('');
+      setLat('');
+      setLon('');
+      setCondition('Rainfall');
+      if (markerRef.current) {
+        mapRef.current.removeLayer(markerRef.current);
+        markerRef.current = null;
+      }
+      alert('Severe report added successfully');
+    } catch (err) {
+      console.error('Error adding severe report:', err);
+      setError('Failed to add severe report');
+    }
+  };
+
+  const deleteSevereReport = async (reportId) => {
+    try {
+      await db.collection('severe_reports').doc(reportId).delete();
+      setSevereReports(severeReports.filter((r) => r.id !== reportId));
+      alert('Severe report deleted successfully');
+    } catch (err) {
+      console.error('Error deleting severe report:', err);
+      setError('Failed to delete severe report');
+    }
+  };
+
+  const formatTimestamp = (timestamp) => {
+    if (!timestamp) return 'Unknown';
+    try {
+      const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+      return date.toLocaleString('en-GB', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'Europe/London'
+      });
+    } catch {
+      return 'Unknown';
+    }
+  };
+
+  return (
+    <div className="p-6 container mx-auto">
+      <h1 className="text-3xl font-bold text-gray-800 mb-6">Add Severe Weather Report</h1>
+      {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
+      <div className="flex flex-col md:flex-row gap-6">
+        <div className="md:w-1/3 bg-white p-6 rounded-lg shadow-md">
+          <h2 className="text-xl font-semibold text-gray-700 mb-4">Submit Severe Weather Report</h2>
+          <div className="mb-4">
+            <label className="block text-gray-700 mb-2">Date</label>
+            <input
+              type="date"
+              value={date}
+              onChange={(e) => setDate(e.target.value)}
+              className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div className="mb-4">
+            <label className="block text-gray-700 mb-2">Observed Time</label>
+            <input
+              type="time"
+              value={observedTime}
+              onChange={(e) => setObservedTime(e.target.value)}
+              className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div className="mb-4">
+            <label className="block text-gray-700 mb-2">Condition</label>
+            <select
+              value={condition}
+              onChange={(e) => setCondition(e.target.value)}
+              className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              {['Rainfall', 'Hail', 'Tornado', 'Gusts'].map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
+          <div className="mb-4">
+            <label className="block text-gray-700 mb-2">Latitude</label>
+            <input
+              type="number"
+              value={lat}
+              onChange={(e) => setLat(e.target.value)}
+              placeholder="Click map to select"
+              className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div className="mb-4">
+            <label className="block text-gray-700 mb-2">Longitude</label>
+            <input
+              type="number"
+              value={lon}
+              onChange={(e) => setLon(e.target.value)}
+              placeholder="Click map to select"
+              className="w-full p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <button
+            onClick={addSevereReport}
+            className="w-full bg-blue-600 text-white p-3 rounded-lg hover:bg-blue-700 transition"
+          >
+            Submit Report
+          </button>
+          <h2 className="text-xl font-semibold text-gray-700 mt-6 mb-4">Your Severe Reports</h2>
+          <ul className="space-y-2 max-h-60 overflow-y-auto">
+            {severeReports.map((report) => (
+              <li key={report.id} className="p-3 bg-gray-100 rounded-lg">
+                {report.date} - {report.condition} at [{report.location[1].toFixed(4)}, {report.location[0].toFixed(4)}]
+                <br />
+                Created: {formatTimestamp(report.createdAt)}
+                <br />
+                Observed: {report.observedAt ? new Date(report.observedAt).toLocaleString('en-GB', {
+                  day: '2-digit',
+                  month: '2-digit',
+                  year: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  timeZone: 'Europe/London'
+                }) : 'Unknown'}
+                <button
+                  onClick={() => deleteSevereReport(report.id)}
+                  className="ml-2 text-red-500 hover:text-red-700"
+                >
+                  Delete
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div className="md:w-2/3">
+          <div id="severe-report-map" className="h-[500px] w-full rounded-lg shadow-md"></div>
+        </div>
+      </div>
+    </div>
+  );
+};
 const LeaderboardPage = () => {
   const [users, setUsers] = useState([]);
   const [error, setError] = useState(null);
@@ -2983,6 +3815,36 @@ const LeaderboardPage = () => {
     }
   };
 
+  // Initialize the Leaflet map
+  useEffect(() => {
+    waitForLeaflet(() => {
+      try {
+        const map = L.map('archive-map').setView([54.5, -3], 6);
+        mapRef.current = map;
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          maxZoom: 19,
+          attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        }).addTo(map).on('tileerror', error => {
+          console.error('Tile error:', error);
+          setError('Failed to load map tiles');
+        });
+
+        setTimeout(() => {
+          map.invalidateSize();
+          console.log('Map size invalidated for ArchivePage');
+        }, 100);
+
+        return () => {
+          console.log('Cleaning up ArchivePage map');
+          map.remove();
+        };
+      } catch (err) {
+        console.error('Error initializing ArchivePage map:', err);
+        setError('Failed to initialize map');
+      }
+    });
+  }, []);
+
   useEffect(() => {
     const fetchOutlooks = async () => {
       try {
@@ -3026,28 +3888,6 @@ const LeaderboardPage = () => {
   }, [dateFilter, searchUsername, sortBy, outlooks]);
 
   useEffect(() => {
-    waitForLeaflet(() => {
-      try {
-        const map = L.map('archive-map').setView([54.5, -3], 6);
-        mapRef.current = map;
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          maxZoom: 19,
-          attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-        }).addTo(map);
-        setTimeout(() => {
-          map.invalidateSize();
-        }, 100);
-        return () => {
-          map.remove();
-        };
-      } catch (err) {
-        console.error('Error initializing ArchivePage map:', err);
-        setError('Failed to initialize map');
-      }
-    });
-  }, []);
-
-  useEffect(() => {
     if (!mapRef.current || !selectedOutlook) return;
     geoJsonLayersRef.current.forEach(layer => {
       if (mapRef.current.hasLayer(layer)) {
@@ -3063,19 +3903,20 @@ const LeaderboardPage = () => {
               ...p,
               geometry: {
                 ...p.geometry,
-                coordinates: JSON.parse(p.geometry.coordinates)
+                coordinates: JSON.parse(p.geometry.coordinates),
               },
               properties: {
                 ...p.properties,
                 Name: p.properties.Name || 'low risk',
-                color: p.properties.color || RISK_COLORS[p.properties.Name?.toLowerCase() || 'low risk']
-              }
+                color: p.properties.color || RISK_COLORS[p.properties.Name?.toLowerCase() || 'low risk'],
+              },
             };
           } catch (err) {
             console.error('Error parsing polygon:', p, err);
             return null;
           }
-        }).filter(p => p !== null);
+        })
+        .filter(p => p !== null);
 
       const polygonsByRisk = RISK_ORDER.reduce((acc, risk) => {
         acc[risk] = parsedPolygons.filter(p => p.properties.Name?.toLowerCase() === risk);
@@ -3089,8 +3930,8 @@ const LeaderboardPage = () => {
               color: feature.properties.color,
               fillColor: feature.properties.Name.toLowerCase() === 'severe risk' ? 'transparent' : feature.properties.color,
               fillOpacity: feature.properties.Name.toLowerCase() === 'severe risk' ? 0 : 0.4,
-              weight: 2
-            })
+              weight: 2,
+            }),
           }).addTo(mapRef.current);
           geoJsonLayersRef.current.push(layer);
         }
@@ -3102,8 +3943,8 @@ const LeaderboardPage = () => {
           type: 'Feature',
           geometry: {
             type: 'Point',
-            coordinates: s.coordinates
-          }
+            coordinates: s.coordinates,
+          },
         }));
         if (lightningLayerRef.current) {
           mapRef.current.removeLayer(lightningLayerRef.current);
@@ -3112,8 +3953,8 @@ const LeaderboardPage = () => {
           pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
             radius: 5,
             color: '#ff0',
-            fillOpacity: 0.8
-          })
+            fillOpacity: 0.8,
+          }),
         });
         if (showLightning) {
           lightningLayerRef.current.addTo(mapRef.current);
@@ -3124,7 +3965,12 @@ const LeaderboardPage = () => {
         .where('date', '==', selectedOutlook.date)
         .get()
         .then(snapshot => {
-          const reports = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          const reports = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data(),
+            createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt),
+            observedAt: doc.data().observedAt ? new Date(doc.data().observedAt) : null,
+          }));
           setSevereReports(reports);
           const severeFeatures = reports
             .filter(r => r.location && r.location.length === 2)
@@ -3132,11 +3978,14 @@ const LeaderboardPage = () => {
               type: 'Feature',
               geometry: {
                 type: 'Point',
-                coordinates: r.location
+                coordinates: r.location,
               },
               properties: {
-                condition: r.condition
-              }
+                condition: r.condition,
+                createdBy: r.createdBy,
+                createdAt: r.createdAt,
+                observedAt: r.observedAt,
+              },
             }));
           if (severeLayerRef.current) {
             mapRef.current.removeLayer(severeLayerRef.current);
@@ -3145,8 +3994,13 @@ const LeaderboardPage = () => {
             pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
               radius: 5,
               color: '#f00',
-              fillOpacity: 0.8
-            })
+              fillOpacity: 0.8,
+            }).bindPopup(`
+              <b>Condition:</b> ${feature.properties.condition}<br/>
+              <b>Created By:</b> ${feature.properties.createdBy || 'Unknown'}<br/>
+              <b>Created:</b> ${feature.properties.createdAt ? feature.properties.createdAt.toLocaleString('en-GB') : 'Unknown'}<br/>
+              <b>Observed:</b> ${feature.properties.observedAt ? feature.properties.observedAt.toLocaleString('en-GB') : 'Unknown'}
+            `),
           });
           if (showSevereReports) {
             severeLayerRef.current.addTo(mapRef.current);
@@ -3195,7 +4049,7 @@ const LeaderboardPage = () => {
         year: 'numeric',
         hour: '2-digit',
         minute: '2-digit',
-        timeZone: 'Europe/London'
+        timeZone: 'Europe/London',
       });
     } catch {
       return 'Unknown';
@@ -3344,6 +4198,9 @@ const LeaderboardPage = () => {
             <Route path="/admin">
               {user && user.email === 'admin@example.com' ? <AdminPage /> : <Redirect to="/" />}
             </Route>
+            <Route path="/add-severe-report">
+              {user ? <AddSevereReportPage user={user} /> : <Redirect to="/account" />}
+            </Route>
             <Route path="/leaderboard" component={LeaderboardPage} />
           </Switch>
         </div>
@@ -3357,5 +4214,4 @@ const LeaderboardPage = () => {
       </BrowserRouter>
     );
   </script>
-</body>
-</html> 
+</html>
