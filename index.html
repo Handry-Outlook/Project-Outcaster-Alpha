@@ -1258,688 +1258,728 @@
   );
 };
 
-    const CreateOutlookPage = ({ user, username, email }) => {
-      const [drawnItems, setDrawnItems] = useState([]);
-      const [riskLevel, setRiskLevel] = useState('low risk');
-      const [severeConditions, setSevereConditions] = useState({
-        rainfall: false,
-        hail: false,
-        tornado: false,
-        gusts: false
+    const debounce = (func, wait) => {
+  let timeout;
+  return (...args) => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => func(...args), wait);
+  };
+};
+
+const CreateOutlookPage = ({ user, username, email }) => {
+  const [drawnItems, setDrawnItems] = useState([]);
+  const [riskLevel, setRiskLevel] = useState('low risk');
+  const [severeConditions, setSevereConditions] = useState({
+    rainfall: false,
+    hail: false,
+    tornado: false,
+    gusts: false
+  });
+  const [selectedPolygonId, setSelectedPolygonId] = useState(null);
+  const [dataError, setDataError] = useState(null);
+  const [validationError, setValidationError] = useState(null);
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const [forecastDate, setForecastDate] = useState(tomorrow.toISOString().split('T')[0]);
+  const [drafts, setDrafts] = useState([]);
+  const [selectedDraftId, setSelectedDraftId] = useState('');
+  const [draftName, setDraftName] = useState('');
+  const mapRef = useRef(null);
+  const drawRef = useRef(null);
+  const currentRiskLevel = useRef(riskLevel); // Track current risk level to avoid stale state
+
+  // Sync currentRiskLevel with riskLevel state
+  useEffect(() => {
+    currentRiskLevel.current = riskLevel;
+  }, [riskLevel]);
+
+  const getNextVersion = async (collection, email, date) => {
+    try {
+      const snapshot = await db.collection(collection)
+        .where('email', '==', email)
+        .where('date', '==', date)
+        .get();
+      const count = snapshot.size;
+      return `version ${count + 1}`;
+    } catch (err) {
+      console.error(`Error fetching version count for ${collection}:`, err);
+      return 'version 1';
+    }
+  };
+
+  const validatePolygonContainment = (polygons) => {
+    console.log('Validating polygon containment:', polygons);
+    try {
+      const containmentRules = {
+        'slight risk': 'low risk',
+        'enhanced risk': 'slight risk',
+        'moderate risk': 'enhanced risk',
+        'high risk': 'moderate risk'
+      };
+
+      for (let i = 0; i < polygons.length; i++) {
+        const poly1 = polygons[i];
+        const risk1 = poly1.properties.Name.toLowerCase();
+
+        if (risk1 === 'severe risk' || risk1 === 'low risk') continue;
+
+        const requiredContainerRisk = containmentRules[risk1];
+        if (!requiredContainerRisk) continue;
+
+        if (!poly1.geometry || !poly1.geometry.coordinates) {
+          return `Error: Invalid polygon data for ${poly1.properties.Name}`;
+        }
+        const turfPoly1 = turf.polygon(poly1.geometry.coordinates);
+
+        let isContained = false;
+        for (let j = 0; j < polygons.length; j++) {
+          if (i === j) continue;
+          const poly2 = polygons[j];
+          const risk2 = poly2.properties.Name.toLowerCase();
+          if (risk2 !== requiredContainerRisk) continue;
+
+          if (!poly2.geometry || !poly2.geometry.coordinates) {
+            return `Error: Invalid polygon data for ${poly2.properties.Name}`;
+          }
+          const turfPoly2 = turf.polygon(poly2.geometry.coordinates);
+
+          if (turf.booleanContains(turfPoly2, turfPoly1)) {
+            isContained = true;
+            break;
+          }
+        }
+
+        if (!isContained) {
+          return `Error: ${poly1.properties.Name} must be fully contained within a ${requiredContainerRisk} area.`;
+        }
+      }
+      return null;
+    } catch (err) {
+      console.error('Error in validatePolygonContainment:', err);
+      return `Error validating polygon containment: ${err.message}`;
+    }
+  };
+
+  const updateDrawnFeatures = () => {
+    console.log('Updating drawn features');
+    const features = drawRef.current.getAll().features;
+    // Only update the state and map source, do not modify existing feature properties
+    features.sort((a, b) => RISK_ORDER.indexOf(b.properties.Name.toLowerCase()) - RISK_ORDER.indexOf(a.properties.Name.toLowerCase()));
+    setDrawnItems(features);
+    if (mapRef.current.getSource('drawnFeatures')) {
+      mapRef.current.getSource('drawnFeatures').setData({
+        type: 'FeatureCollection',
+        features: features
       });
-      const [selectedPolygonId, setSelectedPolygonId] = useState(null);
-      const [dataError, setDataError] = useState(null);
-      const [sizeError, setSizeError] = useState(null);
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      const [forecastDate, setForecastDate] = useState(tomorrow.toISOString().split('T')[0]);
-      const [drafts, setDrafts] = useState([]);
-      const [selectedDraftId, setSelectedDraftId] = useState('');
-      const [draftName, setDraftName] = useState('');
-      const mapRef = useRef(null);
-      const drawRef = useRef(null);
+      console.log('Updated map source with features');
+    }
+  };
 
-      const getNextVersion = async (collection, email, date) => {
-        try {
-          const snapshot = await db.collection(collection)
-            .where('email', '==', email)
-            .where('date', '==', date)
-            .get();
-          const count = snapshot.size;
-          return `version ${count + 1}`;
-        } catch (err) {
-          console.error(`Error fetching version count for ${collection}:`, err);
-          return 'version 1';
-        }
-      };
+  useEffect(() => {
+    waitForMapbox(() => {
+      if (!window.mapboxgl) {
+        console.error('Mapbox GL JS not loaded');
+        setDataError('Failed to load map. Please refresh the page.');
+        return;
+      }
+      mapboxgl.accessToken = 'pk.eyJ1IjoiaGFuZHJ5MjAxOTEwMjYiLCJhIjoiY21jYWg2eG1lMDNkYTJxczVyOWM5bW9mciJ9.bA-qxiByTB_RseY1fgU4rg';
+      const map = new mapboxgl.Map({
+        container: 'create-map',
+        style: 'mapbox://styles/mapbox/streets-v11',
+        center: [-3, 54.5],
+        zoom: 6,
+        minZoom: 3,
+        maxZoom: 10,
+        maxBounds: [[UK_BBOX[0], UK_BBOX[1]], [UK_BBOX[2], UK_BBOX[3]]]
+      });
+      mapRef.current = map;
 
-      const validatePolygonSizes = (polygons) => {
-        console.log('Validating polygons:', polygons);
-        for (let i = 0; i < polygons.length; i++) {
-          const poly1 = polygons[i];
-          if (!poly1.geometry || !poly1.geometry.coordinates || !poly1.properties.Name) {
-            return `Error: Invalid polygon data at index ${i}`;
-          }
-          if (poly1.properties.Name.toLowerCase() === 'severe risk') continue;
-          try {
-            const area1 = turf.area(turf.polygon(poly1.geometry.coordinates));
-            const riskIndex1 = RISK_ORDER.indexOf(poly1.properties.Name.toLowerCase());
-            for (let k = i + 1; k < polygons.length; k++) {
-              const poly2 = polygons[k];
-              if (!poly2.geometry || !poly2.geometry.coordinates) {
-                return `Error: Invalid polygon data at index ${k}`;
-              }
-              if (poly2.properties.Name.toLowerCase() === 'severe risk') continue;
-              const area2 = turf.area(turf.polygon(poly2.geometry.coordinates));
-              const riskIndex2 = RISK_ORDER.indexOf(poly2.properties.Name.toLowerCase());
-              if (riskIndex1 > riskIndex2 && area1 > area2) {
-                return `Error: ${poly1.properties.Name} area must be smaller than ${poly2.properties.Name} area.`;
-              }
-              if (riskIndex2 > riskIndex1 && area2 > area1) {
-                return `Error: ${poly2.properties.Name} area must be smaller than ${poly1.properties.Name} area.`;
-              }
+      map.on('load', () => {
+        map.resize();
+        console.log('Map resized after load');
+      });
+
+      const draw = new MapboxDraw({
+        displayControlsDefault: false,
+        controls: {
+          polygon: true,
+          trash: true
+        },
+        defaultMode: 'draw_polygon',
+        styles: [
+          {
+            id: 'gl-draw-polygon-fill-inactive',
+            type: 'fill',
+            filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon']],
+            paint: {
+              'fill-color': ['get', 'color'],
+              'fill-opacity': ['case', ['==', ['get', 'Name'], 'severe risk'], 0, 0.4]
             }
-          } catch (err) {
-            console.error('Error in validatePolygonSizes:', err);
-            return `Error validating polygon sizes: ${err.message}`;
-          }
-        }
-        return null;
-      };
-
-      const updateDrawnFeatures = () => {
-        console.log('Updating drawn features');
-        const features = drawRef.current.getAll().features;
-        features.forEach(feature => {
-          if (!feature.properties?.Name) {
-            feature.properties = {
-              Name: riskLevel,
-              color: RISK_COLORS[riskLevel],
-              severeConditions: riskLevel === 'severe risk' ? severeConditions : {}
-            };
-            console.log('Set properties for feature', feature.id, ':', feature.properties);
-          }
-        });
-        features.sort((a, b) => RISK_ORDER.indexOf(b.properties.Name.toLowerCase()) - RISK_ORDER.indexOf(a.properties.Name.toLowerCase()));
-        setDrawnItems(features);
-        if (mapRef.current.getSource('drawnFeatures')) {
-          mapRef.current.getSource('drawnFeatures').setData({
-            type: 'FeatureCollection',
-            features: features
-          });
-          console.log('Updated map source with features');
-        }
-      };
-
-      useEffect(() => {
-        waitForMapbox(() => {
-          if (!window.mapboxgl) {
-            console.error('Mapbox GL JS not loaded');
-            setDataError('Failed to load map. Please refresh the page.');
-            return;
-          }
-          mapboxgl.accessToken = 'pk.eyJ1IjoiaGFuZHJ5MjAxOTEwMjYiLCJhIjoiY21jYWg2eG1lMDNkYTJxczVyOWM5bW9mciJ9.bA-qxiByTB_RseY1fgU4rg';
-          const map = new mapboxgl.Map({
-            container: 'create-map',
-            style: 'mapbox://styles/mapbox/streets-v11',
-            center: [-3, 54.5],
-            zoom: 6,
-            minZoom: 3,
-            maxZoom: 10,
-            maxBounds: [[UK_BBOX[0], UK_BBOX[1]], [UK_BBOX[2], UK_BBOX[3]]]
-          });
-          mapRef.current = map;
-
-          // Add this line to resize the map after initialization
-          map.on('load', () => {
-            map.resize();
-            console.log('Map resized after load');
-          });
-
-          const draw = new MapboxDraw({
-            displayControlsDefault: false,
-            controls: {
-              polygon: true,
-              trash: true
-            },
-            defaultMode: 'draw_polygon',
-            styles: [
-              {
-                id: 'gl-draw-polygon-fill-inactive',
-                type: 'fill',
-                filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon']],
-                paint: {
-                  'fill-color': ['get', 'color'],
-                  'fill-opacity': ['case', ['==', ['get', 'Name'], 'severe risk'], 0, 0.4]
-                }
-              },
-              {
-                id: 'gl-draw-polygon-stroke-inactive',
-                type: 'line',
-                filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon']],
-                paint: {
-                  'line-color': ['get', 'color'],
-                  'line-width': 2
-                }
-              },
-              {
-                id: 'gl-draw-polygon-fill-active',
-                type: 'fill',
-                filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
-                paint: {
-                  'fill-color': ['get', 'color'],
-                  'fill-opacity': ['case', ['==', ['get', 'Name'], 'severe risk'], 0, 0.4]
-                }
-              },
-              {
-                id: 'gl-draw-polygon-stroke-active',
-                type: 'line',
-                filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
-                paint: {
-                  'line-color': ['get', 'color'],
-                  'line-width': 3
-                }
-              },
-              {
-                id: 'gl-draw-polygon-midpoint',
-                type: 'circle',
-                filter: ['all', ['==', '$type', 'Point'], ['==', 'meta', 'midpoint']],
-                paint: {
-                  'circle-radius': 3,
-                  'circle-color': '#fbb03b'
-                }
-              },
-              {
-                id: 'gl-draw-polygon-vertex-inactive',
-                type: 'circle',
-                filter: ['all', ['==', 'meta', 'vertex'], ['==', '$type', 'Point'], ['!=', 'mode', 'static']],
-                paint: {
-                  'circle-radius': 5,
-                  'circle-color': '#fff'
-                }
-              }
-            ]
-          });
-          map.addControl(draw);
-          drawRef.current = draw;
-
-          map.on('draw.create', (e) => {
-            console.log('Draw create event:', e);
-            const feature = e.features[0];
-            // Alter this block to ensure the polygon uses the current riskLevel
-            feature.properties = {
-              Name: riskLevel,
-              color: RISK_COLORS[riskLevel],
-              severeConditions: riskLevel === 'severe risk' ? severeConditions : {}
-            };
-            console.log('Created feature', feature.id, 'with properties:', feature.properties);
-            const newItems = [...drawnItems, feature];
-            const validationError = validatePolygonSizes(newItems);
-            if (validationError) {
-              setSizeError(validationError); // Corrected line
-              draw.delete(feature.id);
-            } else {
-              setSizeError(null);
-              setDrawnItems(newItems);
-              setSelectedPolygonId(feature.id);
+          },
+          {
+            id: 'gl-draw-polygon-stroke-inactive',
+            type: 'line',
+            filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon']],
+            paint: {
+              'line-color': ['get', 'color'],
+              'line-width': 2
             }
-            updateDrawnFeatures();
-          });
-
-          map.on('draw.update', updateDrawnFeatures);
-          map.on('draw.delete', updateDrawnFeatures);
-          map.on('draw.selectionchange', (e) => {
-            const selected = e.features[0]?.id;
-            setSelectedPolygonId(selected || null);
-            if (selected) {
-              const feature = drawRef.current.get(selected);
-              if (feature) {
-                setRiskLevel(feature.properties.Name);
-                if (feature.properties.Name === 'severe risk') {
-                  setSevereConditions(feature.properties.severeConditions || {
-                    rainfall: false,
-                    hail: false,
-                    tornado: false,
-                    gusts: false
-                  });
-                } else {
-                  setSevereConditions({
-                    rainfall: false,
-                    hail: false,
-                    tornado: false,
-                    gusts: false
-                  });
-                }
-                drawRef.current.changeMode('direct_select', { featureId: selected });
-              }
+          },
+          {
+            id: 'gl-draw-polygon-fill-active',
+            type: 'fill',
+            filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
+            paint: {
+              'fill-color': ['get', 'color'],
+              'fill-opacity': ['case', ['==', ['get', 'Name'], 'severe risk'], 0, 0.4]
             }
-          });
-
-          map.on('draw.modechange', (e) => {
-            console.log('Mode changed to:', e.mode);
-            if (e.mode === 'simple_select' && selectedPolygonId) {
-              drawRef.current.changeMode('direct_select', { featureId: selectedPolygonId });
+          },
+          {
+            id: 'gl-draw-polygon-stroke-active',
+            type: 'line',
+            filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
+            paint: {
+              'line-color': ['get', 'color'],
+              'line-width': 3
             }
-          });
-
-          map.on('load', () => {
-            console.log('Map loaded');
-            map.addSource('drawnFeatures', {
-              type: 'geojson',
-              data: { type: 'FeatureCollection', features: [] }
-            });
-            map.addLayer({
-              id: 'drawnPolygons',
-              type: 'fill',
-              source: 'drawnFeatures',
-              filter: ['!=', 'Name', 'severe risk'],
-              paint: {
-                'fill-color': ['get', 'color'],
-                'fill-opacity': [
-                  'interpolate',
-                  ['linear'],
-                  ['zoom'],
-                  3, 0.2,
-                  10, 0.4
-                ]
-              }
-            });
-            map.addLayer({
-              id: 'drawnPolygonsOutline',
-              type: 'line',
-              source: 'drawnFeatures',
-              paint: {
-                'line-color': ['case', ['==', ['get', 'Name'], 'severe risk'], '#000000', ['get', 'color']],
-                'line-width': 2
-              }
-            });
-            map.addLayer({
-              id: 'drawnSeverePolygons',
-              type: 'fill',
-              source: 'drawnFeatures',
-              filter: ['==', 'Name', 'severe risk'],
-              paint: {
-                'fill-opacity': 0
-              }
-            });
-          });
-
-          db.collection('drafts')
-            .where('email', '==', email)
-            .get()
-            .then(snapshot => {
-              const draftsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-              console.log('Fetched drafts:', draftsData);
-              setDrafts(draftsData);
-            })
-            .catch(err => {
-              console.error('Error fetching drafts:', err);
-              setDataError('Failed to load drafts');
-            });
-
-          return () => {
-            console.log('Cleaning up CreateOutlookPage map');
-            map.remove();
-          };
-        });
-      }, [email]);
-
-      const updateRiskLevel = (newRiskLevel) => {
-        console.log('Updating risk level to:', newRiskLevel);
-        setRiskLevel(newRiskLevel);
-        if (selectedPolygonId) {
-          const feature = drawRef.current.get(selectedPolygonId);
-          if (feature) {
-            drawRef.current.setFeatureProperty(selectedPolygonId, 'Name', newRiskLevel);
-            drawRef.current.setFeatureProperty(selectedPolygonId, 'color', RISK_COLORS[newRiskLevel]);
-            drawRef.current.setFeatureProperty(selectedPolygonId, 'severeConditions', newRiskLevel === 'severe risk' ? severeConditions : {});
-            console.log('Updated feature', selectedPolygonId, 'to', newRiskLevel);
-            updateDrawnFeatures();
-          }
-        }
-      };
-
-      const updateSevereConditions = (newConditions) => {
-        console.log('Updating severe conditions:', newConditions);
-        setSevereConditions(newConditions);
-        if (selectedPolygonId && riskLevel === 'severe risk') {
-          drawRef.current.setFeatureProperty(selectedPolygonId, 'severeConditions', newConditions);
-          console.log('Updated severe conditions for feature', selectedPolygonId);
-          updateDrawnFeatures();
-        }
-      };
-
-      const submitOutlook = async () => {
-        console.log('Submitting outlook with drawnItems:', drawnItems, 'forecast date:', forecastDate);
-        if (drawnItems.length === 0) {
-          console.warn('No polygons drawn');
-          alert('Please draw at least one polygon before submitting.');
-          return;
-        }
-        if (!forecastDate) {
-          console.warn('No forecast date provided');
-          alert('Please select a forecast date.');
-          return;
-        }
-        if (email !== 'admin@example.com') {
-          const currentDate = new Date().toISOString().split('T')[0]; 
-          const selectedDateTime = new Date(forecastDate);
-          if (selectedDateTime <= currentDate) {
-            console.warn('Selected date is invalid or in the past:', forecastDate);
-            alert('Forecast date cannot be in the past or today.');
-            return;
-          }
-        }
-        const validationError = validatePolygonSizes(drawnItems);
-        if (validationError) {
-          console.warn('Validation error:', validationError);
-          alert(`Validation error: ${validationError}`);
-          return;
-        }
-
-        try {
-          const serializedPolygons = drawnItems.map(polygon => ({
-            ...polygon,
-            geometry: {
-              ...polygon.geometry,
-              coordinates: JSON.stringify(polygon.geometry.coordinates)
-            },
-            properties: {
-              ...polygon.properties,
-              Name: polygon.properties.Name,
-              color: RISK_COLORS[polygon.properties.Name.toLowerCase()]
+          },
+          {
+            id: 'gl-draw-polygon-midpoint',
+            type: 'circle',
+            filter: ['all', ['==', '$type', 'Point'], ['==', 'meta', 'midpoint']],
+            paint: {
+              'circle-radius': 3,
+              'circle-color': '#fbb03b'
             }
-          }));
-          console.log('Serialized polygons for Firestore:', serializedPolygons);
-
-          const version = await getNextVersion('outlooks', email, forecastDate);
-          const outlookRef = await db.collection('outlooks').add({
-            username,
-            email: email || user.email,
-            polygons: serializedPolygons,
-            date: forecastDate,
-            severeConditions: drawnItems.some(item => item.properties.Name === 'severe risk') ? severeConditions : {},
-            timestamp: firebase.firestore.FieldValue.serverTimestamp(),
-            score: null,
-            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-            version,
-            likes: []
-          });
-          console.log('Outlook saved, ID:', outlookRef.id, 'Version:', version);
-
-          alert('Outlook submitted successfully! Score will be calculated after the forecast period ends.');
-          setDrawnItems([]);
-          setSelectedPolygonId(null);
-          drawRef.current.deleteAll();
-          if (mapRef.current.getSource('drawnFeatures')) {
-            mapRef.current.getSource('drawnFeatures').setData({
-              type: 'FeatureCollection',
-              features: []
-            });
-          }
-        } catch (err) {
-          console.error('Error submitting outlook:', err);
-          alert(`Submission failed: ${err.message}`);
-        }
-      };
-
-      const saveDraft = async () => {
-        if (!draftName) {
-          alert('Please enter a name for the draft.');
-          return;
-        }
-        if (drawnItems.length === 0) {
-          alert('Please draw at least one polygon to save as a draft.');
-          return;
-        }
-        if (!forecastDate) {
-          alert('Please select a forecast date.');
-          return;
-        }
-        try {
-          const serializedPolygons = drawnItems.map(polygon => ({
-            ...polygon,
-            geometry: {
-              ...polygon.geometry,
-              coordinates: JSON.stringify(polygon.geometry.coordinates)
-            },
-            properties: {
-              ...polygon.properties,
-              Name: polygon.properties.Name,
-              color: RISK_COLORS[polygon.properties.Name.toLowerCase()]
+          },
+          {
+            id: 'gl-draw-polygon-vertex-inactive',
+            type: 'circle',
+            filter: ['all', ['==', 'meta', 'vertex'], ['==', '$type', 'Point'], ['!=', 'mode', 'static']],
+            paint: {
+              'circle-radius': 5,
+              'circle-color': '#fff'
             }
-          }));
-          const version = await getNextVersion('drafts', email, forecastDate);
-          const draftData = {
-            username,
-            email: email || user.email,
-            polygons: serializedPolygons,
-            date: forecastDate,
-            name: draftName,
-            timestamp: firebase.firestore.FieldValue.serverTimestamp(),
-            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-            version
-          };
-          let draftRef;
-          if (selectedDraftId) {
-            draftRef = await db.collection('drafts').doc(selectedDraftId).set(draftData);
-            console.log('Draft updated, ID:', selectedDraftId, 'Version:', version);
-          } else {
-            draftRef = await db.collection('drafts').add(draftData);
-            console.log('Draft saved, ID:', draftRef.id, 'Version:', version);
-            setSelectedDraftId(draftRef.id);
           }
-          const draftsSnapshot = await db.collection('drafts').where('email', '==', email).get();
-          setDrafts(draftsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-          alert('Draft saved successfully!');
-        } catch (err) {
-          console.error('Error saving draft:', err);
-          alert(`Failed to save draft: ${err.message}`);
-        }
-      };
+        ]
+      });
+      map.addControl(draw);
+      drawRef.current = draw;
 
-      const loadDraft = (draftId) => {
-        const draft = drafts.find(d => d.id === draftId);
-        if (!draft) {
-          console.error('Draft not found:', draftId);
-          return;
-        }
-        console.log('Loading draft:', draftId, draft);
-        setSelectedDraftId(draftId);
-        setDraftName(draft.name);
-        setForecastDate(draft.date);
-        const parsedPolygons = draft.polygons.map(p => ({
-          ...p,
-          geometry: {
-            ...p.geometry,
-            coordinates: JSON.parse(p.geometry.coordinates)
-          }
-        }));
-        setDrawnItems(parsedPolygons);
-        drawRef.current.deleteAll();
-        parsedPolygons.forEach(feature => {
-          drawRef.current.add(feature);
-        });
-        if (mapRef.current.getSource('drawnFeatures')) {
-          mapRef.current.getSource('drawnFeatures').setData({
-            type: 'FeatureCollection',
-            features: parsedPolygons
-          });
-        }
-        setSelectedPolygonId(null);
-        setRiskLevel('low risk');
-        setSevereConditions({
-          rainfall: false,
-          hail: false,
-          tornado: false,
-          gusts: false
-        });
-      };
-
-      const deletePolygon = (id) => {
-        console.log('Deleting polygon:', id);
-        drawRef.current.delete(id);
-        setDrawnItems(drawnItems.filter(item => item.id !== id));
-        setSelectedPolygonId(null);
-        setRiskLevel('low risk');
-        setSevereConditions({
-          rainfall: false,
-          hail: false,
-          tornado: false,
-          gusts: false
-        });
-        updateDrawnFeatures();
-      };
-
-      const handleSevereChange = (e) => {
-        console.log('Handling severe change:', e.target.name, e.target.checked);
-        const newConditions = {
-          ...severeConditions,
-          [e.target.name]: e.target.checked
+      map.on('draw.create', (e) => {
+        console.log('Draw create event:', e);
+        const feature = e.features[0];
+        // Explicitly set properties for the new feature
+        drawRef.current.setFeatureProperty(feature.id, 'Name', currentRiskLevel.current);
+        drawRef.current.setFeatureProperty(feature.id, 'color', RISK_COLORS[currentRiskLevel.current]);
+        drawRef.current.setFeatureProperty(feature.id, 'severeConditions', currentRiskLevel.current === 'severe risk' ? severeConditions : {});
+        feature.properties = {
+          Name: currentRiskLevel.current,
+          color: RISK_COLORS[currentRiskLevel.current],
+          severeConditions: currentRiskLevel.current === 'severe risk' ? severeConditions : {}
         };
-        updateSevereConditions(newConditions);
-      };
+        console.log('Created feature', feature.id, 'with properties:', feature.properties);
+        const newItems = [...drawnItems, feature];
+        setDrawnItems(newItems);
+        setSelectedPolygonId(feature.id);
+        setValidationError(null);
+        updateDrawnFeatures();
+      });
 
-      const clearPolygons = () => {
-        console.log('Clearing polygons');
-        setDrawnItems([]);
-        setSelectedPolygonId(null);
-        setSelectedDraftId('');
-        setDraftName('');
-        setRiskLevel('low risk');
-        setSevereConditions({
-          rainfall: false,
-          hail: false,
-          tornado: false,
-          gusts: false
-        });
-        drawRef.current.deleteAll();
-        setSizeError(null);
-        if (mapRef.current.getSource('drawnFeatures')) {
-          mapRef.current.getSource('drawnFeatures').setData({
-            type: 'FeatureCollection',
-            features: []
+      map.on('draw.update', () => {
+        updateDrawnFeatures();
+        setValidationError(null);
+      });
+
+      map.on('draw.delete', () => {
+        updateDrawnFeatures();
+        setValidationError(null);
+      });
+
+      map.on('draw.selectionchange', (e) => {
+        const selected = e.features[0]?.id || null;
+        setSelectedPolygonId(selected);
+        if (selected && drawRef.current) {
+          const feature = drawRef.current.get(selected);
+          if (feature && feature.properties) {
+            setRiskLevel(feature.properties.Name);
+            if (feature.properties.Name === 'severe risk') {
+              setSevereConditions(feature.properties.severeConditions || {
+                rainfall: false,
+                hail: false,
+                tornado: false,
+                gusts: false
+              });
+            } else {
+              setSevereConditions({
+                rainfall: false,
+                hail: false,
+                tornado: false,
+                gusts: false
+              });
+            }
+            drawRef.current.changeMode('direct_select', { featureId: selected });
+          }
+        } else {
+          setRiskLevel(currentRiskLevel.current);
+          setSevereConditions({
+            rainfall: false,
+            hail: false,
+            tornado: false,
+            gusts: false
           });
-          console.log('Cleared map source');
         }
-      };
+      });
 
-      return (
-        <div className="p-6 container mx-auto">
-          <h1 className="text-3xl font-bold text-gray-800 mb-6">Create Your Outlook</h1>
-          <p className="text-gray-600 mb-4">Draw risk areas on the map and select their risk levels for the chosen date (06:00 to next day 05:59):</p>
-          {dataError && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{dataError}</p>}
-          {sizeError && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{sizeError}</p>}
-          <div className="flex flex-col md:flex-row gap-6">
-            <div className="md:w-1/3 bg-white p-6 rounded-lg shadow-md">
-              <h2 className="text-xl font-semibold text-gray-700 mb-4">Draft Management</h2>
-              <input
-                type="text"
-                value={draftName}
-                onChange={e => setDraftName(e.target.value)}
-                placeholder="Draft Name"
-                className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-              <select
-                value={selectedDraftId}
-                onChange={e => loadDraft(e.target.value)}
-                className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+      map.on('draw.modechange', (e) => {
+        console.log('Mode changed to:', e.mode);
+        if (e.mode === 'simple_select' && selectedPolygonId) {
+          drawRef.current.changeMode('direct_select', { featureId: selectedPolygonId });
+        }
+      });
+
+      map.on('load', () => {
+        console.log('Map loaded');
+        map.addSource('drawnFeatures', {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] }
+        });
+        map.addLayer({
+          id: 'drawnPolygons',
+          type: 'fill',
+          source: 'drawnFeatures',
+          filter: ['!=', 'Name', 'severe risk'],
+          paint: {
+            'fill-color': ['get', 'color'],
+            'fill-opacity': [
+              'interpolate',
+              ['linear'],
+              ['zoom'],
+              3, 0.2,
+              10, 0.4
+            ]
+          }
+        });
+        map.addLayer({
+          id: 'drawnPolygonsOutline',
+          type: 'line',
+          source: 'drawnFeatures',
+          paint: {
+            'line-color': ['case', ['==', ['get', 'Name'], 'severe risk'], '#000000', ['get', 'color']],
+            'line-width': 2
+          }
+        });
+        map.addLayer({
+          id: 'drawnSeverePolygons',
+          type: 'fill',
+          source: 'drawnFeatures',
+          filter: ['==', 'Name', 'severe risk'],
+          paint: {
+            'fill-opacity': 0
+          }
+        });
+      });
+
+      db.collection('drafts')
+        .where('email', '==', email)
+        .get()
+        .then(snapshot => {
+          const draftsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+          console.log('Fetched drafts:', draftsData);
+          setDrafts(draftsData);
+        })
+        .catch(err => {
+          console.error('Error fetching drafts:', err);
+          setDataError('Failed to load drafts');
+        });
+
+      return () => {
+        console.log('Cleaning up CreateOutlookPage map');
+        map.remove();
+      };
+    });
+  }, [email]);
+
+  const updateRiskLevel = debounce((newRiskLevel) => {
+    console.log('Updating risk level to:', newRiskLevel);
+    setRiskLevel(newRiskLevel);
+    if (selectedPolygonId && drawRef.current) {
+      const feature = drawRef.current.get(selectedPolygonId);
+      if (feature) {
+        drawRef.current.setFeatureProperty(selectedPolygonId, 'Name', newRiskLevel);
+        drawRef.current.setFeatureProperty(selectedPolygonId, 'color', RISK_COLORS[newRiskLevel]);
+        drawRef.current.setFeatureProperty(selectedPolygonId, 'severeConditions', newRiskLevel === 'severe risk' ? severeConditions : {});
+        console.log('Updated feature', selectedPolygonId, 'to', newRiskLevel);
+        updateDrawnFeatures();
+        setValidationError(null);
+      }
+    }
+  }, 200);
+
+  const updateSevereConditions = (newConditions) => {
+    console.log('Updating severe conditions:', newConditions);
+    setSevereConditions(newConditions);
+    if (selectedPolygonId && riskLevel === 'severe risk') {
+      drawRef.current.setFeatureProperty(selectedPolygonId, 'severeConditions', newConditions);
+      console.log('Updated severe conditions for feature', selectedPolygonId);
+      updateDrawnFeatures();
+      setValidationError(null);
+    }
+  };
+
+  const submitOutlook = async () => {
+    console.log('Submitting outlook with drawnItems:', drawnItems, 'forecast date:', forecastDate);
+    if (drawnItems.length === 0) {
+      setValidationError('Please draw at least one polygon before submitting.');
+      return;
+    }
+    if (!forecastDate) {
+      setValidationError('Please select a forecast date.');
+      return;
+    }
+    if (email !== 'admin@example.com') {
+      const currentDate = new Date();
+      currentDate.setHours(0, 0, 0, 0);
+      const selectedDateTime = new Date(forecastDate);
+      selectedDateTime.setHours(0, 0, 0, 0);
+      if (selectedDateTime <= currentDate) {
+        setValidationError('Forecast date cannot be in the past or today.');
+        return;
+      }
+    }
+    const validationError = validatePolygonContainment(drawnItems);
+    if (validationError) {
+      setValidationError(validationError);
+      return;
+    }
+
+    try {
+      const serializedPolygons = drawnItems.map(polygon => ({
+        ...polygon,
+        geometry: {
+          ...polygon.geometry,
+          coordinates: JSON.stringify(polygon.geometry.coordinates)
+        },
+        properties: {
+          ...polygon.properties,
+          Name: polygon.properties.Name,
+          color: RISK_COLORS[polygon.properties.Name.toLowerCase()]
+        }
+      }));
+      console.log('Serialized polygons for Firestore:', serializedPolygons);
+
+      const version = await getNextVersion('outlooks', email, forecastDate);
+      const outlookRef = await db.collection('outlooks').add({
+        username,
+        email: email || user.email,
+        polygons: serializedPolygons,
+        date: forecastDate,
+        severeConditions: drawnItems.some(item => item.properties.Name === 'severe risk') ? severeConditions : {},
+        timestamp: firebase.firestore.FieldValue.serverTimestamp(),
+        score: null,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        version,
+        likes: []
+      });
+      console.log('Outlook saved, ID:', outlookRef.id, 'Version:', version);
+
+      alert('Outlook submitted successfully! Score will be calculated after the forecast period ends.');
+      setDrawnItems([]);
+      setSelectedPolygonId(null);
+      drawRef.current.deleteAll();
+      if (mapRef.current.getSource('drawnFeatures')) {
+        mapRef.current.getSource('drawnFeatures').setData({
+          type: 'FeatureCollection',
+          features: []
+        });
+      }
+      setValidationError(null);
+    } catch (err) {
+      console.error('Error submitting outlook:', err);
+      setValidationError(`Submission failed: ${err.message}`);
+    }
+  };
+
+  const saveDraft = async () => {
+    if (!draftName) {
+      setValidationError('Please enter a name for the draft.');
+      return;
+    }
+    if (drawnItems.length === 0) {
+      setValidationError('Please draw at least one polygon to save as a draft.');
+      return;
+    }
+    if (!forecastDate) {
+      setValidationError('Please select a forecast date.');
+      return;
+    }
+    try {
+      const serializedPolygons = drawnItems.map(polygon => ({
+        ...polygon,
+        geometry: {
+          ...polygon.geometry,
+          coordinates: JSON.stringify(polygon.geometry.coordinates)
+        },
+        properties: {
+          ...polygon.properties,
+          Name: polygon.properties.Name,
+          color: RISK_COLORS[polygon.properties.Name.toLowerCase()]
+        }
+      }));
+      const version = await getNextVersion('drafts', email, forecastDate);
+      const draftData = {
+        username,
+        email: email || user.email,
+        polygons: serializedPolygons,
+        date: forecastDate,
+        name: draftName,
+        timestamp: firebase.firestore.FieldValue.serverTimestamp(),
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        version
+      };
+      let draftRef;
+      if (selectedDraftId) {
+        draftRef = await db.collection('drafts').doc(selectedDraftId).set(draftData);
+        console.log('Draft updated, ID:', selectedDraftId, 'Version:', version);
+      } else {
+        draftRef = await db.collection('drafts').add(draftData);
+        console.log('Draft saved, ID:', draftRef.id, 'Version:', version);
+        setSelectedDraftId(draftRef.id);
+      }
+      const draftsSnapshot = await db.collection('drafts').where('email', '==', email).get();
+      setDrafts(draftsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      alert('Draft saved successfully!');
+      setValidationError(null);
+    } catch (err) {
+      console.error('Error saving draft:', err);
+      setValidationError(`Failed to save draft: ${err.message}`);
+    }
+  };
+
+  const loadDraft = (draftId) => {
+    const draft = drafts.find(d => d.id === draftId);
+    if (!draft) {
+      console.error('Draft not found:', draftId);
+      return;
+    }
+    console.log('Loading draft:', draftId, draft);
+    setSelectedDraftId(draftId);
+    setDraftName(draft.name);
+    setForecastDate(draft.date);
+    const parsedPolygons = draft.polygons.map(p => ({
+      ...p,
+      geometry: {
+        ...p.geometry,
+        coordinates: JSON.parse(p.geometry.coordinates)
+      }
+    }));
+    setDrawnItems(parsedPolygons);
+    drawRef.current.deleteAll();
+    parsedPolygons.forEach(feature => {
+      drawRef.current.add(feature);
+    });
+    if (mapRef.current.getSource('drawnFeatures')) {
+      mapRef.current.getSource('drawnFeatures').setData({
+        type: 'FeatureCollection',
+        features: parsedPolygons
+      });
+    }
+    setSelectedPolygonId(null);
+    setRiskLevel('low risk');
+    setSevereConditions({
+      rainfall: false,
+      hail: false,
+      tornado: false,
+      gusts: false
+    });
+    setValidationError(null);
+  };
+
+  const deletePolygon = (id) => {
+    console.log('Deleting polygon:', id);
+    drawRef.current.delete(id);
+    setDrawnItems(drawnItems.filter(item => item.id !== id));
+    setSelectedPolygonId(null);
+    setRiskLevel('low risk');
+    setSevereConditions({
+      rainfall: false,
+      hail: false,
+      tornado: false,
+      gusts: false
+    });
+    updateDrawnFeatures();
+    setValidationError(null);
+  };
+
+  const handleSevereChange = (e) => {
+    console.log('Handling severe change:', e.target.name, e.target.checked);
+    const newConditions = {
+      ...severeConditions,
+      [e.target.name]: e.target.checked
+    };
+    updateSevereConditions(newConditions);
+  };
+
+  const clearPolygons = () => {
+    console.log('Clearing polygons');
+    setDrawnItems([]);
+    setSelectedPolygonId(null);
+    setSelectedDraftId('');
+    setDraftName('');
+    setRiskLevel('low risk');
+    setSevereConditions({
+      rainfall: false,
+      hail: false,
+      tornado: false,
+      gusts: false
+    });
+    drawRef.current.deleteAll();
+    if (mapRef.current.getSource('drawnFeatures')) {
+      mapRef.current.getSource('drawnFeatures').setData({
+        type: 'FeatureCollection',
+        features: []
+      });
+      console.log('Cleared map source');
+    }
+    setValidationError(null);
+  };
+
+  return (
+    <div className="p-6 container mx-auto">
+      <h1 className="text-3xl font-bold text-gray-800 mb-6">Create Your Outlook</h1>
+      <p className="text-gray-600 mb-4">Draw risk areas on the map and select their risk levels for the chosen date (06:00 to next day 05:59):</p>
+      {(dataError || validationError) && (
+        <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{dataError || validationError}</p>
+      )}
+      <div className="flex flex-col md:flex-row gap-6">
+        <div className="md:w-1/3 bg-white p-6 rounded-lg shadow-md">
+          <h2 className="text-xl font-semibold text-gray-700 mb-4">Draft Management</h2>
+          <input
+            type="text"
+            value={draftName}
+            onChange={e => setDraftName(e.target.value)}
+            placeholder="Draft Name"
+            className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <select
+            value={selectedDraftId}
+            onChange={e => loadDraft(e.target.value)}
+            className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            <option value="">Select a Draft</option>
+            {drafts.map(draft => (
+              <option key={draft.id} value={draft.id}>{draft.name} ({draft.date})</option>
+            ))}
+          </select>
+          <button
+            onClick={saveDraft}
+            className="w-full bg-purple-600 text-white p-3 mb-4 rounded-lg hover:bg-purple-700 transition"
+          >
+            {selectedDraftId ? 'Update Draft' : 'Save as Draft'}
+          </button>
+          <h2 className="text-xl font-semibold text-gray-700 mb-4">Forecast Date</h2>
+          <input
+            type="date"
+            value={forecastDate}
+            onChange={e => setForecastDate(e.target.value)}
+            min={email === 'admin@example.com' ? undefined : new Date().toISOString().split('T')[0]}
+            className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <h2 className="text-xl font-semibold text-gray-700 mb-4">Risk Level</h2>
+          <select
+            value={riskLevel}
+            onChange={e => updateRiskLevel(e.target.value)}
+            className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+          >
+            {RISK_ORDER.map(risk => (
+              <option key={risk} value={risk}>{risk.charAt(0).toUpperCase() + risk.slice(1)}</option>
+            ))}
+          </select>
+          {riskLevel === 'severe risk' && selectedPolygonId && (
+            <>
+              <h2 className="text-xl font-semibold text-gray-700 mb-4">Severe Conditions</h2>
+              {['rainfall', 'hail', 'tornado', 'gusts'].map(condition => (
+                <label key={condition} className="flex items-center mb-2">
+                  <input
+                    type="checkbox"
+                    name={condition}
+                    checked={severeConditions[condition]}
+                    onChange={handleSevereChange}
+                    className="mr-2 h-5 w-5 text-blue-600"
+                  />
+                  <span className="text-gray-600">
+                    {condition.charAt(0).toUpperCase() + condition.slice(1)}
+                    {condition === 'rainfall' && ' (>25mm/3hr)'}
+                    {condition === 'hail' && ' (>2cm)'}
+                    {condition === 'tornado' && ''}
+                    {condition === 'gusts' && ' (>55mph)'}
+                  </span>
+                </label>
+              ))}
+            </>
+          )}
+          <h2 className="text-xl font-semibold text-gray-700 mb-4">Drawn Polygons</h2>
+          <ul className="space-y-2 mb-4 max-h-60 overflow-y-auto">
+            {drawnItems.map(item => (
+              <li
+                key={item.id}
+                className={`p-2 cursor-pointer rounded-lg ${selectedPolygonId === item.id ? 'bg-blue-100' : 'hover:bg-gray-100'}`}
+                onClick={() => {
+                  setSelectedPolygonId(item.id);
+                  setRiskLevel(item.properties.Name);
+                  if (item.properties.Name === 'severe risk') {
+                    setSevereConditions(item.properties.severeConditions || {
+                      rainfall: false,
+                      hail: false,
+                      tornado: false,
+                      gusts: false
+                    });
+                  } else {
+                    setSevereConditions({
+                      rainfall: false,
+                      hail: false,
+                      tornado: false,
+                      gusts: false
+                    });
+                  }
+                  drawRef.current.changeMode('direct_select', { featureId: item.id });
+                }}
               >
-                <option value="">Select a Draft</option>
-                {drafts.map(draft => (
-                  <option key={draft.id} value={draft.id}>{draft.name} ({draft.date})</option>
-                ))}
-              </select>
-              <button
-                onClick={saveDraft}
-                className="w-full bg-purple-600 text-white p-3 mb-4 rounded-lg hover:bg-purple-700 transition"
-              >
-                {selectedDraftId ? 'Update Draft' : 'Save as Draft'}
-              </button>
-              <h2 className="text-xl font-semibold text-gray-700 mb-4">Forecast Date</h2>
-              <input
-                type="date"
-                value={forecastDate}
-                onChange={e => setForecastDate(e.target.value)}
-                min={email === 'admin@example.com' ? undefined : new Date().toISOString().split('T')[0]}
-                className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-              <h2 className="text-xl font-semibold text-gray-700 mb-4">Risk Level</h2>
-              <select
-                value={riskLevel}
-                onChange={e => updateRiskLevel(e.target.value)}
-                className="w-full p-2 mb-4 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-              >
-                {RISK_ORDER.map(risk => (
-                  <option key={risk} value={risk}>{risk.charAt(0).toUpperCase() + risk.slice(1)}</option>
-                ))}
-              </select>
-              {riskLevel === 'severe risk' && selectedPolygonId && (
-                <>
-                  <h2 className="text-xl font-semibold text-gray-700 mb-4">Severe Conditions</h2>
-                  {['rainfall', 'hail', 'tornado', 'gusts'].map(condition => (
-                    <label key={condition} className="flex items-center mb-2">
-                      <input
-                        type="checkbox"
-                        name={condition}
-                        checked={severeConditions[condition]}
-                        onChange={handleSevereChange}
-                        className="mr-2 h-5 w-5 text-blue-600"
-                      />
-                      <span className="text-gray-600">
-                        {condition.charAt(0).toUpperCase() + condition.slice(1)}
-                        {condition === 'rainfall' && ' (>25mm/3hr)'}
-                        {condition === 'hail' && ' (>2cm)'}
-                        {condition === 'tornado' && ''}
-                        {condition === 'gusts' && ' (>55mph)'}
-                      </span>
-                    </label>
-                  ))}
-                </>
-              )}
-              <h2 className="text-xl font-semibold text-gray-700 mb-4">Drawn Polygons</h2>
-              <ul className="space-y-2 mb-4 max-h-60 overflow-y-auto">
-                {drawnItems.map(item => (
-                  <li
-                    key={item.id}
-                    className={`p-2 cursor-pointer rounded-lg ${selectedPolygonId === item.id ? 'bg-blue-100' : 'hover:bg-gray-100'}`}
-                    onClick={() => {
-                      setSelectedPolygonId(item.id);
-                      setRiskLevel(item.properties.Name);
-                      if (item.properties.Name === 'severe risk') {
-                        setSevereConditions(item.properties.severeConditions || {
-                          rainfall: false,
-                          hail: false,
-                          tornado: false,
-                          gusts: false
-                        });
-                      } else {
-                        setSevereConditions({
-                          rainfall: false,
-                          hail: false,
-                          tornado: false,
-                          gusts: false
-                        });
-                      }
-                      drawRef.current.changeMode('direct_select', { featureId: item.id });
-                    }}
-                  >
-                    {item.properties.Name} (ID: {item.id.slice(0, 8)})
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deletePolygon(item.id);
-                      }}
-                      className="ml-2 text-red-500 hover:text-red-700"
-                    >
-                      Delete
-                    </button>
-                  </li>
-                ))}
-              </ul>
-              <div className="flex space-x-4">
+                {item.properties.Name} (ID: {item.id.slice(0, 8)})
                 <button
-                  onClick={submitOutlook}
-                  className="bg-blue-600 text-white p-3 rounded-lg hover:bg-blue-700 transition disabled:bg-blue-400"
-                  disabled={sizeError}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    deletePolygon(item.id);
+                  }}
+                  className="ml-2 text-red-500 hover:text-red-700"
                 >
-                  Submit Outlook
+                  Delete
                 </button>
-                <button
-                  onClick={clearPolygons}
-                  className="bg-red-600 text-white p-3 rounded-lg hover:bg-red-700 transition"
-                >
-                  Clear Polygons
-                </button>
-              </div>
-            </div>
-            <div className="md:w-2/3">
-              <div id="create-map" className="h-[700px] w-full rounded-lg shadow-md"></div>
-            </div>
+              </li>
+            ))}
+          </ul>
+          <div className="flex space-x-4">
+            <button
+              onClick={submitOutlook}
+              className="bg-blue-600 text-white p-3 rounded-lg hover:bg-blue-700 transition"
+            >
+              Submit Outlook
+            </button>
+            <button
+              onClick={clearPolygons}
+              className="bg-red-600 text-white p-3 rounded-lg hover:bg-red-700 transition"
+            >
+              Clear Polygons
+            </button>
           </div>
         </div>
-      );
-    };
+        <div className="md:w-2/3">
+          <div id="create-map" className="h-[700px] w-full rounded-lg shadow-md"></div>
+        </div>
+      </div>
+    </div>
+  );
+};
     const ViewOutlookPage = ({ user }) => {
       const [outlooks, setOutlooks] = useState([]);
       const [filteredOutlooks, setFilteredOutlooks] = useState([]);
