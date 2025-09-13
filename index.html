@@ -1,4 +1,4 @@
-
+//npx http-server .
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -176,7 +176,473 @@
     const importKML = (file, setDrawnItems, drawRef, mapRef, setDataError) => {
       const reader = new FileReader();
       reader.onload = (e) => {
+        try {const WelcomePage = () => {
+  const [error, setError] = useState(null);
+  const [selectedUsername, setSelectedUsername] = useState(null);
+  const [selectedOutlook, setSelectedOutlook] = useState(null);
+  const [communityDate, setCommunityDate] = useState(new Date().toISOString().split('T')[0]);
+  const [communityOutlooks, setCommunityOutlooks] = useState([]);
+  const [cellSize, setCellSize] = useState(window.innerWidth < 768 ? 0.3 : 0.1);
+  const communityMapRef = useRef(null);
+  const forecasterMapRef = useRef(null);
+  const communityMapInitialized = useRef(false);
+  const forecasterMapInitialized = useRef(false);
+
+  const UK_BBOX = [-10.854, 49.864, 1.763, 60.861];
+
+  const RISK_LEVELS = {
+    'no risk': 0,
+    'low risk': 1,
+    'slight risk': 2,
+    'enhanced risk': 3,
+    'moderate risk': 4,
+    'high risk': 5
+  };
+
+  const RISK_COLORS = {
+    'no risk': '#ffffff',
+    'low risk': '#66c2a4',
+    'slight risk': '#fff200',
+    'enhanced risk': '#ff7f27',
+    'moderate risk': '#ec1c24',
+    'high risk': '#b83dba'
+  };
+
+  const RISK_ORDER = ['no risk', 'low risk', 'slight risk', 'enhanced risk', 'moderate risk', 'high risk'];
+
+  const getNextAvailableDate = async (currentDate) => {
+    try {
+      const snapshot = await db.collection('outlooks')
+        .where('date', '>=', currentDate)
+        .orderBy('date', 'asc')
+        .limit(1)
+        .get();
+      return snapshot.empty ? currentDate : snapshot.docs[0].data().date;
+    } catch (err) {
+      console.error('Error finding next available date:', err);
+      return currentDate;
+    }
+  };
+
+  const fetchCommunityOutlook = async (date) => {
+    console.log('Fetching community outlook for date:', date);
+    try {
+      const snapshot = await db.collection('outlooks').where('date', '==', date).get();
+      const allOutlooks = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt || Date.now())
+      }));
+      console.log('Fetched community outlooks:', allOutlooks);
+
+      const latestOutlooks = Object.values(allOutlooks.reduce((acc, outlook) => {
+        if (!outlook.username) return acc;
+        if (!acc[outlook.username] || new Date(outlook.createdAt) > new Date(acc[outlook.username].createdAt)) {
+          acc[outlook.username] = outlook;
+        }
+        return acc;
+      }, {}));
+
+      const allUserOutlooks = await db.collection('outlooks').get();
+      const userScores = allUserOutlooks.docs.reduce((acc, doc) => {
+        const { username, score } = doc.data();
+        if (!username) return acc;
+        acc[username] = acc[username] || { total: 0, count: 0 };
+        if (score != null && !isNaN(score)) {
+          acc[username].total += score;
+          acc[username].count += 1;
+        }
+        return acc;
+      }, {});
+
+      const weightedOutlooks = latestOutlooks.map(outlook => ({
+        ...outlook,
+        weight: userScores[outlook.username]?.count > 0
+          ? userScores[outlook.username].total / userScores[outlook.username].count || 1
+          : 1
+      }));
+
+      setCommunityOutlooks(weightedOutlooks);
+      updateCommunityMap(weightedOutlooks, date);
+    } catch (err) {
+      console.error('Error fetching community outlook:', err);
+      setError(`Failed to load community forecast: ${err.message}`);
+    }
+  };
+
+  const initializeCommunityMap = () => {
+    if (communityMapInitialized.current || !window.L || !document.getElementById('community-map')) return;
+    try {
+      console.log('Initializing community map');
+      const map = L.map('community-map', {
+        zoomControl: true, minZoom: 5, maxZoom: 10,
+        maxBounds: [[UK_BBOX[1], UK_BBOX[0]], [UK_BBOX[3], UK_BBOX[2]]]
+      }).setView([54.5, -3], 6);
+      communityMapRef.current = map;
+      communityMapInitialized.current = true;
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+      }).addTo(map).on('tileerror', (error) => {
+        console.error('Community map tile error:', error);
+        setError('Failed to load community map tiles');
+      });
+      if (communityOutlooks.length) updateCommunityMap(communityOutlooks, communityDate);
+    } catch (err) {
+      console.error('Error initializing community map:', err);
+      setError('Failed to initialize community map');
+    }
+  };
+
+  const initializeForecasterMap = (outlook) => {
+    if (forecasterMapInitialized.current || !window.L || !document.getElementById('welcome-map')) return;
+    try {
+      console.log('Initializing top forecaster map');
+      const map = L.map('welcome-map', {
+        zoomControl: true, minZoom: 5, maxZoom: 10,
+        maxBounds: [[UK_BBOX[1], UK_BBOX[0]], [UK_BBOX[3], UK_BBOX[2]]]
+      }).setView([54.5, -3], 6);
+      forecasterMapRef.current = map;
+      forecasterMapInitialized.current = true;
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+      }).addTo(map).on('tileerror', (error) => {
+        console.error('Top forecaster map tile error:', error);
+        setError('Failed to load map tiles');
+      });
+
+      if (outlook?.polygons?.length) {
+        const parsedPolygons = outlook.polygons.map(p => {
+          try {
+            return {
+              ...p,
+              geometry: { ...p.geometry, coordinates: JSON.parse(p.geometry.coordinates) || p.geometry.coordinates },
+              properties: { ...p.properties, Name: p.properties.Name || 'low risk', color: p.properties.color || RISK_COLORS[p.properties.Name?.toLowerCase() || 'low risk'] }
+            };
+          } catch (err) {
+            console.error('Error parsing polygon:', p, err);
+            return null;
+          }
+        }).filter(p => p);
+        console.log('Parsed polygons for WelcomePage:', parsedPolygons);
+
+        const polygonsByRisk = RISK_ORDER.reduce((acc, risk) => {
+          acc[risk] = parsedPolygons.filter(p => p.properties.Name.toLowerCase() === risk);
+          return acc;
+        }, {});
+
+        RISK_ORDER.forEach(risk => {
+          if (polygonsByRisk[risk].length) {
+            L.geoJSON(polygonsByRisk[risk], {
+              style: feature => ({
+                color: RISK_COLORS[feature.properties.Name?.toLowerCase()] || '#66c2a4',
+                fillColor: risk === 'severe risk' ? 'transparent' : RISK_COLORS[feature.properties.Name?.toLowerCase()] || '#66c2a4',
+                fillOpacity: risk === 'severe risk' ? 0 : 0.4,
+                weight: 2
+              })
+            }).addTo(map);
+            console.log('Added GeoJSON layer for', risk);
+          }
+        });
+      } else {
+        console.warn('No valid outlook provided for top forecaster map:', outlook);
+        setError('No valid forecast areas available');
+      }
+    } catch (err) {
+      console.error('Error initializing top forecaster map:', err);
+      setError('Failed to initialize top forecaster map');
+    }
+  };
+
+  const updateCommunityMap = (outlooks, date) => {
+    if (!communityMapRef.current) {
+      console.warn('Community map not available');
+      setError('Failed to update community map: container not found');
+      return;
+    }
+    console.log('Updating community map');
+    communityMapRef.current.eachLayer(layer => {
+      if (layer instanceof L.Rectangle || layer instanceof L.GeoJSON) communityMapRef.current.removeLayer(layer);
+    });
+
+    if (!outlooks.length) {
+      console.warn('No outlooks provided for community map');
+      setError('No community forecast available for selected date');
+      return;
+    }
+
+    const allPolygons = outlooks.flatMap(outlook =>
+      (outlook.polygons || []).filter(p => p.properties.Name.toLowerCase() !== 'severe risk').map(p => {
         try {
+          return {
+            ...p,
+            geometry: { ...p.geometry, coordinates: JSON.parse(p.geometry.coordinates) || p.geometry.coordinates },
+            properties: { ...p.properties, Name: p.properties.Name || 'low risk', weight: outlook.weight }
+          };
+        } catch (err) {
+          console.error('Error parsing polygon:', p, err);
+          return null;
+        }
+      }).filter(p => p)
+    );
+
+    if (!allPolygons.length) {
+      console.warn('No valid polygons for community outlook');
+      setError('No valid community forecast areas');
+      return;
+    }
+
+    const bbox = [UK_BBOX[0], UK_BBOX[1], UK_BBOX[2], UK_BBOX[3]];
+    const grid = turf.pointGrid(bbox, cellSize, { units: 'degrees' });
+    const gridCells = grid.features.map(point => {
+      let totalWeightedScore = 0, totalWeight = 0;
+      allPolygons.forEach(polygon => {
+        if (turf.booleanPointInPolygon(point, polygon)) {
+          const riskLevel = polygon.properties.Name.toLowerCase();
+          const score = RISK_LEVELS[riskLevel] || 0;
+          const weight = polygon.properties.weight || 1;
+          totalWeightedScore += score * weight;
+          totalWeight += weight;
+        }
+      });
+      const meanScore = totalWeight > 0 ? totalWeightedScore / totalWeight : 0;
+      const roundedScore = Math.round(meanScore);
+      const riskLevel = Object.keys(RISK_LEVELS).find(key => RISK_LEVELS[key] === roundedScore) || 'no risk';
+      const [lng, lat] = point.geometry.coordinates;
+      return {
+        type: 'Feature',
+        geometry: {
+          type: 'Polygon',
+          coordinates: [[
+            [lng - cellSize / 2, lat - cellSize / 2],
+            [lng + cellSize / 2, lat - cellSize / 2],
+            [lng + cellSize / 2, lat + cellSize / 2],
+            [lng - cellSize / 2, lat + cellSize / 2],
+            [lng - cellSize / 2, lat - cellSize / 2]
+          ]]
+        },
+        properties: { Name: riskLevel, score: roundedScore, color: RISK_COLORS[riskLevel] || '#ffffff' }
+      };
+    });
+
+    console.log('Computed grid cells for community map:', gridCells);
+
+    gridCells.forEach(cell => {
+      const bounds = [
+        [cell.geometry.coordinates[0][0][1], cell.geometry.coordinates[0][0][0]],
+        [cell.geometry.coordinates[0][2][1], cell.geometry.coordinates[0][2][0]]
+      ];
+      L.rectangle(bounds, {
+        color: cell.properties.color,
+        fillColor: cell.properties.color,
+        fillOpacity: 0.4,
+        weight: 1
+      }).bindPopup(`Risk Level: ${cell.properties.Name}<br>Score: ${cell.properties.score}`).addTo(communityMapRef.current);
+    });
+
+    requestAnimationFrame(() => {
+      if (communityMapRef.current) communityMapRef.current.invalidateSize();
+      console.log('Community map updated, position:', document.getElementById('community-map')?.getBoundingClientRect());
+    });
+  };
+
+  useEffect(() => {
+    localStorage.setItem('welcomePageVisited', 'true');
+    console.log('Welcome page visited, flag set');
+
+    const fetchAndDisplayOutlook = async () => {
+      try {
+        const currentDate = new Date().toISOString().split('T')[0]; 
+        const snapshot = await db.collection('outlooks').where('date', '>=', currentDate).get();
+        const outlooks = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate ? doc.data().createdAt.toDate() : new Date(doc.data().createdAt || Date.now())
+        }));
+        console.log('Fetched outlooks:', outlooks);
+
+        if (!outlooks.length) {
+          setError('No forecasts available for today or future');
+          return;
+        }
+
+        const averagedScores = outlooks.reduce((acc, curr) => {
+          const { username, score } = curr;
+          if (!username) {
+            console.warn('Outlook missing username:', curr.id, curr);
+            return acc;
+          }
+          acc[username] = acc[username] || { total: 0, count: 0, outlooks: [] };
+          acc[username].outlooks.push(curr);
+          if (score != null && !isNaN(score)) {
+            acc[username].total += score;
+            acc[username].count += 1;
+          }
+          return acc;
+        }, {});
+
+        const sortedUsers = Object.entries(averagedScores).map(([username, data]) => ({
+          username,
+          avgScore: data.count > 0 ? data.total / data.count : 0,
+          outlookCount: data.outlooks.length
+        })).sort((a, b) => (a.avgScore === b.avgScore ? b.outlookCount - a.outlookCount : b.avgScore - a.avgScore));
+
+        let selectedOutlook = null, selectedUsername = null;
+        if (sortedUsers.length) {
+          const topUser = sortedUsers[0].username;
+          const userOutlooks = averagedScores[topUser].outlooks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+          selectedOutlook = userOutlooks[0];
+          selectedUsername = topUser;
+        } else {
+          selectedOutlook = outlooks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+          selectedUsername = selectedOutlook.username || 'Unknown';
+        }
+
+        if (!selectedOutlook) {
+          setError('No valid forecast available to display');
+          return;
+        }
+
+        setSelectedUsername(selectedUsername);
+        setSelectedOutlook(selectedOutlook);
+        initializeCommunityMap();
+        initializeForecasterMap(selectedOutlook);
+
+        const initialDate = await getNextAvailableDate(currentDate);
+        setCommunityDate(initialDate);
+      } catch (err) {
+        console.error('Error fetching or displaying outlook:', err);
+        if (err.code === 'failed-precondition' && err.message.includes('index')) {
+          setError('Database index required. Please contact the administrator.');
+        } else {
+          setError(`Failed to load forecast data: ${err.message}`);
+        }
+      }
+    };
+
+    fetchAndDisplayOutlook();
+
+    return () => {
+      if (communityMapRef.current) {
+        communityMapRef.current.remove();
+        communityMapRef.current = null;
+        communityMapInitialized.current = false;
+      }
+      if (forecasterMapRef.current) {
+        forecasterMapRef.current.remove();
+        forecasterMapRef.current = null;
+        forecasterMapInitialized.current = false;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    console.log('Community date or cell size changed:', { communityDate, cellSize });
+    fetchCommunityOutlook(communityDate);
+  }, [communityDate, cellSize]);
+
+  const handleDateChange = (e) => {
+    const newDate = e.target.value;
+    console.log('Date picker selected:', newDate);
+    setCommunityDate(newDate);
+  };
+
+  const handleCellSizeChange = (e) => {
+    const newCellSize = parseFloat(e.target.value);
+    console.log('Cell size changed:', newCellSize);
+    setCellSize(newCellSize);
+  };
+
+  const formatTimestamp = (timestamp) => {
+    if (!timestamp) return 'Unknown';
+    try {
+      const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+      return date.toLocaleString('en-GB', {
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', timeZone: 'Europe/London'
+      });
+    } catch {
+      return 'Unknown';
+    }
+  };
+
+  const formatValidityPeriod = (dateString) => {
+    if (!dateString) return 'Unknown';
+    try {
+      const forecastDate = new Date(dateString);
+      const nextDay = new Date(forecastDate);
+      nextDay.setDate(forecastDate.getDate() + 1);
+      return `${forecastDate.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' })} 06:00 - ${nextDay.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' })} 05:59`;
+    } catch {
+      return 'Unknown';
+    }
+  };
+
+  const getVersion = (outlook) => outlook?.version || 'Unknown';
+
+  return (
+    <div className="p-4 container mx-auto">
+      <h1 className="text-2xl md:text-3xl font-bold text-gray-800 mb-4">Welcome to Project Outcaster</h1>
+      {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
+      
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="bg-white p-4 rounded-lg shadow-md">
+          <h2 className="text-xl md:text-2xl font-semibold text-gray-700 mb-2">Community Outlook Map</h2>
+          <p className="text-gray-600 mb-2 max-w-md">
+            <span style={{ whiteSpace: 'nowrap' }}>Community forecast for {formatValidityPeriod(communityDate)}</span><br />
+            Based on {communityOutlooks.length} user submissions
+          </p>
+          <div id="community-map" className="h-[300px] md:h-[500px] w-full rounded-lg shadow-md"></div>
+          <div className="mt-4">
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <label htmlFor="community-date" className="text-gray-600">Select Date:</label>
+                <input
+                  id="community-date"
+                  type="date"
+                  value={communityDate}
+                  onChange={handleDateChange}
+                  className="p-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label htmlFor="resolution-slider" className="text-gray-600">Grid Resolution: {cellSize.toFixed(2)}°</label>
+                <input
+                  id="resolution-slider"
+                  type="range"
+                  min="0.05"
+                  max="0.5"
+                  step="0.05"
+                  value={cellSize}
+                  onChange={handleCellSizeChange}
+                  className="w-full md:w-1/2"
+                />
+              </div>
+            </div>
+            <p className="text-gray-600 mb-2 max-w-md">
+              <span style={{ whiteSpace: 'nowrap' }}>Community convective outlook based on users' submitted forecast </span><br />
+              and their forecasting accuracy
+            </p>
+          </div>
+        </div>
+        <div className="bg-white p-4 rounded-lg shadow-md">
+          <h2 className="text-xl md:text-2xl font-semibold text-gray-700 mb-2">Top Forecaster's Outlook Map</h2>
+          <p className="text-gray-600 mb-2 max-w-md">
+            {selectedOutlook && selectedUsername ? (
+              <>
+                Viewing {selectedUsername}'s latest forecast, valid for{' '}
+                {formatValidityPeriod(selectedOutlook.date)}, {getVersion(selectedOutlook)}, published{' '}
+                {formatTimestamp(selectedOutlook.createdAt)}
+              </>
+            ) : (
+              'No forecast selected'
+            )}
+          </p>
+          <div id="welcome-map" className="h-[300px] md:h-[500px] w-full rounded-lg shadow-md"></div>
+        </div>
+      </div>
+    </div>
+  );
+};
           const kmlText = e.target.result;
           const kmlDoc = new DOMParser().parseFromString(kmlText, 'text/xml');
           const geojson = window.toGeoJSON.kml(kmlDoc);
@@ -1192,7 +1658,7 @@
 
   return (
     <div className="p-4 container mx-auto">
-      <h1 className="text-2xl md:text-3xl font-bold text-gray-800 mb-6 text-center">Welcome to Project Outcaster Alpha Test: Feedback form https://forms.gle/GM4M7Hs51gzHK52L9</h1>
+      <h1 className="text-2xl md:text-3xl font-bold text-gray-800 mb-6 text-center">Welcome to Project Outcaster</h1>
       {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg text-center">{error}</p>}
       
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-start">
@@ -1257,7 +1723,6 @@
     </div>
   );
 };
-
     const debounce = (func, wait) => {
   let timeout;
   return (...args) => {
@@ -1980,6 +2445,7 @@ const CreateOutlookPage = ({ user, username, email }) => {
     </div>
   );
 };
+
     const ViewOutlookPage = ({ user }) => {
       const [outlooks, setOutlooks] = useState([]);
       const [filteredOutlooks, setFilteredOutlooks] = useState([]);
@@ -2241,7 +2707,51 @@ const CreateOutlookPage = ({ user, username, email }) => {
       );
     };
     
-    
+    const RealtimeWeatherPage = ({ user }) => {
+  const navigate = useNavigate();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    // Check if user is logged in
+    if (!user) {
+      navigate('/login'); // Redirect to login page if not authenticated
+      return;
+    }
+    // Simulate loading state for placeholder
+    setTimeout(() => {
+      setLoading(false);
+    }, 1000);
+  }, [user, navigate]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen">
+        <div className="text-2xl text-gray-600">Loading...</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="p-6 container mx-auto">
+        <p className="text-red-500 bg-red-100 p-3 rounded-lg">{error}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 container mx-auto">
+      <h1 className="text-3xl font-bold text-gray-800 mb-6">Realtime Weather</h1>
+      {/* Placeholder for your 5000-line HTML/CSS/JS code */}
+      <div className="bg-white p-6 rounded-lg shadow-md">
+        <p className="text-gray-700">Hello World</p>
+        {/* Add your 5000-line HTML/CSS/JS code here */}
+      </div>
+    </div>
+  );
+};
+
     const YourUploadsPage = ({ user, username, email }) => {
   const [outlooks, setOutlooks] = useState([]);
   const [drafts, setDrafts] = useState([]);
@@ -3398,7 +3908,7 @@ const CreateOutlookPage = ({ user, username, email }) => {
 
   return (
     <div className="p-6 container mx-auto max-w-md">
-      <h1 className="text-3xl font-bold text-gray-800 mb-6">{isRegistering ? 'Register' : 'Login/ Join alpha test from https://forms.gle/QaFngRHgiGXTZd6E9'}</h1>
+      <h1 className="text-3xl font-bold text-gray-800 mb-6">{isRegistering ? 'Register' : 'Login'}</h1>
       {error && <p className="text-red-500 mb-4 bg-red-100 p-3 rounded-lg">{error}</p>}
       <div className="bg-white p-6 rounded-lg shadow-md">
         {isRegistering && (
@@ -3439,7 +3949,15 @@ const CreateOutlookPage = ({ user, username, email }) => {
         >
           {isRegistering ? 'Register' : 'Login'}
         </button>
-        
+        <p className="mt-4 text-gray-600 text-center">
+          {isRegistering ? 'Already have an account?' : 'Need an account?'}
+          <button
+            onClick={() => setIsRegistering(!isRegistering)}
+            className="text-blue-500 hover:underline ml-1"
+          >
+            {isRegistering ? 'Login' : 'Register'}
+          </button>
+        </p>
       </div>
     </div>
   );
